@@ -82,7 +82,7 @@ def create_ffmpeg_stream_command(
         "-hls_time",
         "0.5",
         "-hls_list_size",
-        "3",
+        "10",
         "-hls_delete_threshold",
         "1",
         "-hls_flags",
