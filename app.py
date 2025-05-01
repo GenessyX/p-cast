@@ -18,6 +18,7 @@ from starlette.staticfiles import StaticFiles
 
 from cast import find_media_controller, get_local_ip, subscribe_to_stream
 from ffmpeg import create_ffmpeg_stream_command
+from pipewire import get_default_sink
 
 logger = logging.getLogger(__name__)
 
@@ -65,8 +66,10 @@ async def lifespan(
         subscribe_to_stream(mc, local_ip)
 
     with tempfile.TemporaryDirectory() as stream_dir:
+        sink = get_default_sink()
+        logger.info("Casting from sink: %s", sink)
         ffmpeg_command = create_ffmpeg_stream_command(
-            sink="sink_name.monitor",
+            sink=f"{sink}.monitor",
             stream_dir=stream_dir,
             bitrate="512k",
         )
