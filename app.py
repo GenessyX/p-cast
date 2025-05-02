@@ -64,7 +64,8 @@ async def lifespan(
     app: Starlette,
     media_controller: MediaController,
 ) -> AsyncIterator[None]:
-    stream_config = StreamConfig(acodec="aac", bitrate="512k")
+    stream_config = StreamConfig(acodec="aac", bitrate="256k")
+
     app.state.media_controller = media_controller
 
     async def subscribe(mc: MediaController, local_ip: str) -> None:

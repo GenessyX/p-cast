@@ -1,10 +1,10 @@
 from dataclasses import dataclass
-from enum import Enum
 from typing import Literal
 
 from exceptions import StreamError
 
-type AudioCodec = Literal["aac", "libopus"]
+type AudioCodec = Literal["aac"]
+type HlsSegmentType = Literal["mpegts", "fmp4"]
 
 sample_rates: dict[AudioCodec, list[int]] = {
     "aac": [
@@ -22,21 +22,7 @@ sample_rates: dict[AudioCodec, list[int]] = {
         8000,
         7350,
     ],
-    "libopus": [48000, 24000, 16000, 12000, 8000],
 }
-
-
-class HlsSegmentType(str, Enum):
-    MPEG_TS = "mpegts"
-    FMP4 = "fmp4"
-
-    @property
-    def chromecast_format(self) -> str | None:
-        match self:
-            case HlsSegmentType.MPEG_TS:
-                return None
-            case HlsSegmentType.FMP4:
-                return "fmp4"
 
 
 @dataclass
@@ -44,9 +30,17 @@ class StreamConfig:
     acodec: AudioCodec = "aac"
     bitrate: str = "192k"
     sampling_frequency: int = 48000
-    hls_segment_type: HlsSegmentType = HlsSegmentType.MPEG_TS
+    hls_segment_type: HlsSegmentType = "mpegts"
 
     def __post_init__(self) -> None:
         if self.sampling_frequency not in sample_rates.get(self.acodec, []):
             msg = "Invalid sampling rate"
             raise StreamError(msg)
+
+    @property
+    def chromecast_hls_segment_type(self) -> str | None:
+        match self.hls_segment_type:
+            case "mpegts":
+                return "ts_aac"
+            case "fmp4":
+                return "fmp4"

@@ -69,7 +69,7 @@ def subscribe_to_stream(
         title="p-cast stream",
         stream_type=STREAM_TYPE_LIVE,
         media_info={
-            "hlsSegmentFormat": config.hls_segment_type.chromecast_format,
+            "hlsSegmentFormat": config.chromecast_hls_segment_type,
         },
     )
     mc.seek(999999999)

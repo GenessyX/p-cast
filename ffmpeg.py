@@ -8,6 +8,10 @@ def create_ffmpeg_stream_command(
 ) -> list[str]:
     if config is None:
         config = StreamConfig()
+
+    acodec = []
+    if config.acodec == "aac":
+        acodec = ["-c:a", "aac", "-profile:a", "aac_low"]
     return [
         "ffmpeg",
         "-y",
@@ -52,8 +56,7 @@ def create_ffmpeg_stream_command(
         # "-c:v",
         # "copy",
         ## COPY --
-        "-c:a",
-        config.acodec,
+        *acodec,
         "-b:a",
         config.bitrate,
         "-ar",
@@ -89,7 +92,7 @@ def create_ffmpeg_stream_command(
         "-hls_flags",
         "split_by_time+program_date_time+independent_segments+append_list",
         "-hls_segment_type",
-        config.hls_segment_type.value,
+        config.hls_segment_type,
         "-master_pl_name",
         "index.m3u8",
         "-var_stream_map",
