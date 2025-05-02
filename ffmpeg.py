@@ -1,12 +1,13 @@
-from typing import Literal
+from config import StreamConfig
 
 
 def create_ffmpeg_stream_command(
     sink: str,
     stream_dir: str,
-    bitrate: str = "192k",
-    sampling_frequency: Literal[44100, 48000] = 44100,
+    config: StreamConfig | None = None,
 ) -> list[str]:
+    if config is None:
+        config = StreamConfig()
     return [
         "ffmpeg",
         "-y",
@@ -52,11 +53,11 @@ def create_ffmpeg_stream_command(
         # "copy",
         ## COPY --
         "-c:a",
-        "aac",
+        config.acodec,
         "-b:a",
-        bitrate,
+        config.bitrate,
         "-ar",
-        str(sampling_frequency),
+        str(config.sampling_frequency),
         "-fflags",
         "nobuffer",
         "-flags",
@@ -82,13 +83,13 @@ def create_ffmpeg_stream_command(
         "-hls_time",
         "0.5",
         "-hls_list_size",
-        "10",
+        "6",
         "-hls_delete_threshold",
         "1",
         "-hls_flags",
         "split_by_time+program_date_time+independent_segments+append_list",
         "-hls_segment_type",
-        "mpegts",
+        config.hls_segment_type.value,
         "-master_pl_name",
         "index.m3u8",
         "-var_stream_map",

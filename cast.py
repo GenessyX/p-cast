@@ -13,6 +13,8 @@ from pychromecast.controllers.media import (
 )
 from pychromecast.discovery import CastBrowser, SimpleCastListener
 
+from config import StreamConfig
+
 logger = logging.getLogger(__name__)
 
 
@@ -54,7 +56,11 @@ def get_local_ip() -> str:
         s.close()
 
 
-def subscribe_to_stream(mc: MediaController, local_ip: str) -> None:
+def subscribe_to_stream(
+    mc: MediaController,
+    local_ip: str,
+    config: StreamConfig,
+) -> None:
     url = f"http://{local_ip}:3000/stream/index.m3u8"
     logger.info("Subscribing to: %s", url)
     mc.play_media(
@@ -62,4 +68,8 @@ def subscribe_to_stream(mc: MediaController, local_ip: str) -> None:
         content_type="application/vnd.apple.mpegurl",
         title="p-cast stream",
         stream_type=STREAM_TYPE_LIVE,
+        media_info={
+            "hlsSegmentFormat": config.hls_segment_type.chromecast_format,
+        },
     )
+    mc.seek(999999999)

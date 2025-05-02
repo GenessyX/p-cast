@@ -17,3 +17,8 @@ dependencies = [
 [tool.pyright]
 reportUnusedCallResult = false
 reportUnknownMemberType = false
+
+[dependency-groups]
+types = [
+    "mypy>=1.15.0",
+]
