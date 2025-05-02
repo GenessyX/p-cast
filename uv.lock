@@ -232,7 +232,6 @@ version = "0.1.0"
 source = { virtual = "." }
 dependencies = [
     { name = "granian" },
-    { name = "pipewire-python" },
     { name = "pulsectl-asyncio" },
     { name = "pychromecast" },
     { name = "socketify" },
@@ -250,7 +249,6 @@ types = [
 [package.metadata]
 requires-dist = [
     { name = "granian", specifier = ">=2.2.5" },
-    { name = "pipewire-python", specifier = ">=0.2.3" },
     { name = "pulsectl-asyncio", specifier = ">=1.2.2" },
     { name = "pychromecast", specifier = ">=14.0.7" },
     { name = "socketify", specifier = ">=0.0.31" },
@@ -262,15 +260,6 @@ requires-dist = [
 
 [package.metadata.requires-dev]
 types = [{ name = "mypy", specifier = ">=1.15.0" }]
-
-[[package]]
-name = "pipewire-python"
-version = "0.2.3"
-source = { registry = "https://pypi.org/simple" }
-sdist = { url = "https://files.pythonhosted.org/packages/67/7f/eee00d9a89d8b2b8696ef2b6384619114bf3ebc1b44912ba17107a954e2f/pipewire_python-0.2.3.tar.gz", hash = "sha256:4add001b9aecfb40e4629b769d1a86b3fffa576406cab84214c9a04ec77ac955", size = 1339198 }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/6d/2e/c86f4b19d455ee8710d81f991e51726251d0e7db2bb78849c8fbd68d9b37/pipewire_python-0.2.3-py3-none-any.whl", hash = "sha256:f0f7458622d0d33082c08fea2bc1e4046577114c7da44dda420d003f58bc6ce5", size = 17813 },
-]
 
 [[package]]
 name = "protobuf"
