@@ -232,6 +232,8 @@ version = "0.1.0"
 source = { virtual = "." }
 dependencies = [
     { name = "granian" },
+    { name = "pipewire-python" },
+    { name = "pulsectl-asyncio" },
     { name = "pychromecast" },
     { name = "socketify" },
     { name = "starlette" },
@@ -248,6 +250,8 @@ types = [
 [package.metadata]
 requires-dist = [
     { name = "granian", specifier = ">=2.2.5" },
+    { name = "pipewire-python", specifier = ">=0.2.3" },
+    { name = "pulsectl-asyncio", specifier = ">=1.2.2" },
     { name = "pychromecast", specifier = ">=14.0.7" },
     { name = "socketify", specifier = ">=0.0.31" },
     { name = "starlette", specifier = ">=0.46.2" },
@@ -258,6 +262,15 @@ requires-dist = [
 
 [package.metadata.requires-dev]
 types = [{ name = "mypy", specifier = ">=1.15.0" }]
+
+[[package]]
+name = "pipewire-python"
+version = "0.2.3"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/67/7f/eee00d9a89d8b2b8696ef2b6384619114bf3ebc1b44912ba17107a954e2f/pipewire_python-0.2.3.tar.gz", hash = "sha256:4add001b9aecfb40e4629b769d1a86b3fffa576406cab84214c9a04ec77ac955", size = 1339198 }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/6d/2e/c86f4b19d455ee8710d81f991e51726251d0e7db2bb78849c8fbd68d9b37/pipewire_python-0.2.3-py3-none-any.whl", hash = "sha256:f0f7458622d0d33082c08fea2bc1e4046577114c7da44dda420d003f58bc6ce5", size = 17813 },
+]
 
 [[package]]
 name = "protobuf"
@@ -271,6 +284,27 @@ wheels = [
     { url = "https://files.pythonhosted.org/packages/d0/89/bbb1bff09600e662ad5b384420ad92de61cab2ed0f12ace1fd081fd4c295/protobuf-6.30.2-cp39-abi3-manylinux2014_aarch64.whl", hash = "sha256:50f32cc9fd9cb09c783ebc275611b4f19dfdfb68d1ee55d2f0c7fa040df96815", size = 317319 },
     { url = "https://files.pythonhosted.org/packages/28/50/1925de813499546bc8ab3ae857e3ec84efe7d2f19b34529d0c7c3d02d11d/protobuf-6.30.2-cp39-abi3-manylinux2014_x86_64.whl", hash = "sha256:4f6c687ae8efae6cf6093389a596548214467778146b7245e886f35e1485315d", size = 316212 },
     { url = "https://files.pythonhosted.org/packages/e5/a1/93c2acf4ade3c5b557d02d500b06798f4ed2c176fa03e3c34973ca92df7f/protobuf-6.30.2-py3-none-any.whl", hash = "sha256:ae86b030e69a98e08c77beab574cbcb9fff6d031d57209f574a5aea1445f4b51", size = 167062 },
+]
+
+[[package]]
+name = "pulsectl"
+version = "24.11.0"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/50/41/3c2ab3ecf4f708e155a93a23f42a6f9be1cf3cfd5d4faed197bf9e34ef86/pulsectl-24.11.0.tar.gz", hash = "sha256:0ba32745d3f198d5657af19f7ee3eb007af5a86a306ec3cd45af42e767820d0d", size = 41166 }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/7f/0d/3e12ca4c2c97509597a3a082813d12b5a9c656ae04bc7c02b29ff128c809/pulsectl-24.11.0-py2.py3-none-any.whl", hash = "sha256:7d49641656c88e897492092d1940276e9e83351b3f1a75ee2d02ebc45bb89228", size = 35123 },
+]
+
+[[package]]
+name = "pulsectl-asyncio"
+version = "1.2.2"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "pulsectl" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/62/6c/cf1c49abd874edd460d4c68d860d0dc2605b9fd5958a7ba925e3b0c1ec9b/pulsectl_asyncio-1.2.2.tar.gz", hash = "sha256:ee4c427a10f44d2e38065e480668a47316b5d93612ebe3d05d9318f0fe0d417f", size = 21963 }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/33/aa/7eb363c7c8a697f6c97c2861f6699213a4418d11119198746142a8cce731/pulsectl_asyncio-1.2.2-py3-none-any.whl", hash = "sha256:21c47bcba63e01fe25e2326d73c85952e1aa59174bc51fe4f96bd1ffcc3a6850", size = 16694 },
 ]
 
 [[package]]

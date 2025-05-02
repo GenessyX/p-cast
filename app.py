@@ -8,6 +8,7 @@ from collections.abc import AsyncIterator
 from functools import partial
 from typing import override
 
+from pychromecast import Chromecast
 from pychromecast.controllers.media import MediaController
 from starlette.applications import Starlette
 from starlette.middleware import Middleware
@@ -19,10 +20,10 @@ from starlette.responses import Response
 from starlette.routing import Route
 from starlette.staticfiles import StaticFiles
 
-from cast import find_media_controller, get_local_ip, subscribe_to_stream
+from cast import find_chromecast, get_local_ip, subscribe_to_stream
 from config import StreamConfig
+from device import SinkController
 from ffmpeg import create_ffmpeg_stream_command
-from pipewire import get_default_sink
 
 logger = logging.getLogger(__name__)
 
@@ -62,18 +63,21 @@ class StaticFilesWithCORS(BaseHTTPMiddleware):
 @contextlib.asynccontextmanager
 async def lifespan(
     app: Starlette,
-    media_controller: MediaController,
+    chromecast: Chromecast,
 ) -> AsyncIterator[None]:
+    sink_controller = SinkController(chromecast=chromecast)
+    await sink_controller.init()
+
     stream_config = StreamConfig(acodec="aac", bitrate="256k")
 
-    app.state.media_controller = media_controller
+    app.state.media_controller = chromecast
 
     async def subscribe(mc: MediaController, local_ip: str) -> None:
         await asyncio.sleep(2)
         subscribe_to_stream(mc, local_ip, stream_config)
 
     with tempfile.TemporaryDirectory() as stream_dir:
-        sink = get_default_sink()
+        sink = await sink_controller.get_sink_name()
         logger.info("Casting from sink: %s", sink)
         ffmpeg_command = create_ffmpeg_stream_command(
             sink=f"{sink}.monitor",
@@ -93,11 +97,12 @@ async def lifespan(
 
         local_ip = get_local_ip()
 
-        task = asyncio.create_task(subscribe(media_controller, local_ip))
+        task = asyncio.create_task(subscribe(chromecast.media_controller, local_ip))
 
         yield
 
         task.cancel()
+        await sink_controller.close()
 
 
 def get_media_controller(request: Request) -> MediaController:
@@ -121,7 +126,7 @@ def create_app() -> Starlette:
     logging.basicConfig(level=logging.DEBUG)
     # logging.getLogger(__name__).setLevel(logging.WARNING)
     # logger = logging.getLogger(__name__)
-    mc = find_media_controller()
+    chromecast = find_chromecast()
 
     middleware = [
         Middleware(
@@ -143,6 +148,6 @@ def create_app() -> Starlette:
             Route("/pause", endpoint=pause),
             Route("/play", endpoint=play),
         ],
-        lifespan=partial(lifespan, media_controller=mc),
+        lifespan=partial(lifespan, chromecast=chromecast),
         middleware=middleware,
     )

@@ -18,7 +18,7 @@ from config import StreamConfig
 logger = logging.getLogger(__name__)
 
 
-def find_media_controller() -> MediaController:
+def find_chromecast() -> pychromecast.Chromecast:
     services: dict[UUID, str] = {}
     zconf = zeroconf.Zeroconf()
 
@@ -44,7 +44,7 @@ def find_media_controller() -> MediaController:
     cast = chromecasts[0]
     cast.wait()
     pychromecast.discovery.stop_discovery(browser)
-    return cast.media_controller
+    return cast
 
 
 def get_local_ip() -> str:
