@@ -1,7 +1,6 @@
 import asyncio
 import contextlib
 import logging
-import os
 import tempfile
 import typing
 from collections.abc import AsyncIterator
@@ -86,10 +85,7 @@ async def lifespan(
         )
         logger.info("Starting ffmpeg: %s", " ".join(ffmpeg_command))
 
-        await asyncio.create_subprocess_exec(
-            *ffmpeg_command,
-            env=dict(os.environ) | {"PIPEWIRE_LATENCY": "64/48000"},
-        )
+        await asyncio.create_subprocess_exec(*ffmpeg_command)
 
         stream_app = StaticFilesWithCORS(StaticFiles(directory=stream_dir))
 
@@ -124,7 +120,7 @@ async def play(request: Request) -> Response:
 
 def create_app() -> Starlette:
     logging.basicConfig(level=logging.DEBUG)
-    # logging.getLogger(__name__).setLevel(logging.WARNING)
+    logging.getLogger(__name__).setLevel(logging.INFO)
     # logger = logging.getLogger(__name__)
     chromecast = find_chromecast()
 
