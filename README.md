@@ -25,7 +25,7 @@ Send audio to **P‑Cast** (set it as default sink or route an app explicitly).
 * **Live HLS** – 0.5 s segments; Chromecast buffers 3 -> \~3 s end‑to‑end delay.
 * **Volume follow** – changes to the PipeWire sink volume are mirrored to the Chromecast.
 * **Tiny footprint** – single Python process + FFmpeg child; no browser or GUI required.
-* **Optional reconnection guard** – a `pipewire.conf` snippet keeps the capture stream pinned to the chosen device.
+* **Optional reconnection guard** – a `p-cast-stream.conf` snippet keeps the capture stream pinned to the chosen device.
 
 ## How it works (TL;DR)
 
