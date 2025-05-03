@@ -23,14 +23,20 @@ class SinkController:
         self._listener = asyncio.create_task(self.subscribe())
 
     async def create_sink(self, name: str) -> int:
+        sink_properties = [
+            f"device.description={name}",
+            "channelmix.min-volume=5.0",
+            "channelmix.max-volume=5.0",
+            "channelmix.normalize=true",
+        ]
+        module_args = [
+            f"sink_name={name}",
+            f'sink_properties="{" ".join(sink_properties)}"',
+        ]
+
         module_id = await self._pulse.module_load(
             "module-null-sink",
-            " ".join(
-                [
-                    f"sink_name={name}",
-                    f"sink_properties=device.description={name}",
-                ],
-            ),
+            " ".join(module_args),
         )
         return typing.cast("int", module_id)
 
@@ -57,7 +63,6 @@ class SinkController:
     async def subscribe(self) -> None:
         sink = await self.get_sink()
         current_volume = self.get_volume(sink)
-        self._cast.set_volume(current_volume)
 
         async for event in self._pulse.subscribe_events(
             pulsectl.PulseEventMaskEnum.sink,  # pyright: ignore[reportAttributeAccessIssue]
