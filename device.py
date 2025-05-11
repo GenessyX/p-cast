@@ -60,9 +60,13 @@ class SinkController:
     def get_volume(self, sink: pulsectl.PulseSinkInfo) -> float:
         return typing.cast("int", sink.volume.values[0])
 
+    def get_mute(self, sink: pulsectl.PulseSinkInfo) -> bool:
+        return bool(sink.mute)  # pyright: ignore[reportAttributeAccessIssue]
+
     async def subscribe(self) -> None:
         sink = await self.get_sink()
         current_volume = self.get_volume(sink)
+        current_mute = self.get_mute(sink)
 
         async for event in self._pulse.subscribe_events(
             pulsectl.PulseEventMaskEnum.sink,  # pyright: ignore[reportAttributeAccessIssue]
@@ -74,6 +78,10 @@ class SinkController:
 
             changed_sink = await self.get_sink()
             changed_volume = self.get_volume(changed_sink)
+            changed_mute = self.get_mute(changed_sink)
             if changed_volume != current_volume:
                 self._cast.set_volume(volume=changed_volume)
                 current_volume = changed_volume
+            if changed_mute != current_mute:
+                self._cast.set_volume_muted(muted=changed_mute)
+                current_mute = changed_mute
