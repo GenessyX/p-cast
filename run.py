@@ -8,7 +8,7 @@ if __name__ == "__main__":
     ssl_cert = Path(__file__).parent / "cert.pem"
     ssl_key = Path(__file__).parent / "key.pem"
     server = Server(
-        target="app:create_app",
+        target="p_cast.app:create_app",
         factory=True,
         address="0.0.0.0",  # noqa: S104
         port=3000,

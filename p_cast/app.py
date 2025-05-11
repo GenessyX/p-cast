@@ -19,10 +19,10 @@ from starlette.responses import Response
 from starlette.routing import Route
 from starlette.staticfiles import StaticFiles
 
-from cast import find_chromecast, get_local_ip, subscribe_to_stream
-from config import StreamConfig
-from device import SinkController
-from ffmpeg import create_ffmpeg_stream_command
+from p_cast.cast import find_chromecast, get_local_ip, subscribe_to_stream
+from p_cast.config import StreamConfig
+from p_cast.device import SinkController
+from p_cast.ffmpeg import create_ffmpeg_stream_command
 
 logger = logging.getLogger(__name__)
 

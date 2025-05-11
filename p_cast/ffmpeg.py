@@ -1,4 +1,4 @@
-from config import StreamConfig
+from p_cast.config import StreamConfig
 
 
 def create_ffmpeg_stream_command(

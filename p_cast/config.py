@@ -1,7 +1,7 @@
 from dataclasses import dataclass
 from typing import Literal
 
-from exceptions import StreamError
+from p_cast.exceptions import StreamError
 
 type AudioCodec = Literal["aac"]
 type HlsSegmentType = Literal["mpegts", "fmp4"]

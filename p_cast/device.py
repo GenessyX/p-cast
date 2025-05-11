@@ -5,7 +5,7 @@ import pulsectl
 import pulsectl_asyncio
 from pychromecast import Chromecast
 
-from exceptions import SinkError
+from p_cast.exceptions import SinkError
 
 
 class SinkController:

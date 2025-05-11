@@ -13,7 +13,7 @@ from pychromecast.controllers.media import (
 )
 from pychromecast.discovery import CastBrowser, SimpleCastListener
 
-from config import StreamConfig
+from p_cast.config import StreamConfig
 
 logger = logging.getLogger(__name__)
 
