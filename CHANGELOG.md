@@ -1,6 +1,14 @@
 # CHANGELOG
 
 
+## v1.0.0 (2025-05-11)
+
+### Chores
+
+- Set up semantic-release
+  ([`7a6cd44`](https://github.com/GenessyX/p-cast/commit/7a6cd440d0a80694066d770ccf82e3de8cb3dd15))
+
+
 ## v0.1.0 (2025-05-11)
 
 ### Bug Fixes
