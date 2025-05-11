@@ -8,6 +8,20 @@ Casts local audio-device to chromecast compatible device.
 
 ## Quick start
 
+- Using uvx:
+
+```
+uvx p-cast
+```
+
+- Using pipx:
+
+```
+pipx run p-cast
+```
+
+- Using source code:
+
 ```bash
 git clone https://github.com/GenessyX/p-cast
 cd p-cast
