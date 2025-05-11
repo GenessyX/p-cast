@@ -27,6 +27,9 @@ dependencies = [
     "uvloop>=0.21.0",
 ]
 
+[project.scripts]
+p-cast = "p_cast.__main__:main"
+
 [tool.pyright]
 typeCheckingMode = "standard"
 reportUnusedCallResult = false

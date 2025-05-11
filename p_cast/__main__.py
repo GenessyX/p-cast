@@ -1,12 +1,9 @@
-from pathlib import Path
-
 from granian.constants import Interfaces, Loops
 from granian.log import LogLevels
 from granian.server import Server
 
-if __name__ == "__main__":
-    ssl_cert = Path(__file__).parent / "cert.pem"
-    ssl_key = Path(__file__).parent / "key.pem"
+
+def main() -> None:
     server = Server(
         target="p_cast.app:create_app",
         factory=True,
@@ -17,3 +14,7 @@ if __name__ == "__main__":
         log_level=LogLevels.debug,
     )
     server.serve()
+
+
+if __name__ == "__main__":
+    main()
