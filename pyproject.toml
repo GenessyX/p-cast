@@ -1,6 +1,6 @@
 [project]
 name = "p-cast"
-version = "1.0.0"
+version = "1.1.0"
 description = "Cast audio from pipewire to chromecast device."
 readme = "README.md"
 classifiers = [

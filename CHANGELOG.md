@@ -1,6 +1,19 @@
 # CHANGELOG
 
 
+## v1.1.0 (2025-05-11)
+
+### Chores
+
+- Update readme with uvx, pipx
+  ([`f0ff0ac`](https://github.com/GenessyX/p-cast/commit/f0ff0ac432128264b991936e0a4c91aea0bdf657))
+
+### Features
+
+- Set up project.urls
+  ([`1d7955d`](https://github.com/GenessyX/p-cast/commit/1d7955ddef74c5f792f62ed06cb3c2efe0fd4341))
+
+
 ## v1.0.0 (2025-05-11)
 
 ### Chores
