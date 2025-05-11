@@ -3,6 +3,18 @@ name = "p-cast"
 version = "0.1.0"
 description = "Add your description here"
 readme = "README.md"
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: End Users/Desktop",
+    "Topic :: Multimedia :: Sound/Audio :: Capture/Recording",
+    "Topic :: Multimedia :: Sound/Audio :: Players",
+    "Topic :: Utilities",
+    "Environment :: Console",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.13",
+    "Licennse :: OSI Approved :: GNU General Public License v3 (GPLv3)",
+]
 requires-python = ">=3.12"
 dependencies = [
     "granian>=2.2.5",
