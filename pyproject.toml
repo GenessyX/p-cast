@@ -27,6 +27,11 @@ dependencies = [
     "uvloop>=0.21.0",
 ]
 
+[project.urls]
+Homepage = "https://github.com/GenessyX/p-cast"
+Repository = "https://github.com/GenessyX/p-cast"
+Issues = "https://github.com/GenessyX/p-cast/issues"
+
 [project.scripts]
 p-cast = "p_cast.__main__:main"
 
