@@ -18,7 +18,7 @@ from p_cast.config import StreamConfig
 logger = logging.getLogger(__name__)
 
 
-def find_chromecast() -> pychromecast.Chromecast:
+def find_chromecasts() -> tuple[list[pychromecast.Chromecast], CastBrowser]:
     services: dict[UUID, str] = {}
     zconf = zeroconf.Zeroconf()
 
@@ -41,10 +41,7 @@ def find_chromecast() -> pychromecast.Chromecast:
     if len(chromecasts) == 0:
         sys.exit(1)
 
-    cast = chromecasts[0]
-    cast.wait()
-    pychromecast.discovery.stop_discovery(browser)
-    return cast
+    return chromecasts, browser
 
 
 def get_local_ip() -> str:
@@ -65,7 +62,7 @@ def subscribe_to_stream(
     logger.info("Subscribing to: %s", url)
     mc.play_media(
         url,
-        content_type="application/vnd.apple.mpegurl",
+        content_type=config.content_type,
         title="p-cast stream",
         stream_type=STREAM_TYPE_LIVE,
         media_info={

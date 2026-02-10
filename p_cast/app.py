@@ -1,33 +1,42 @@
 import asyncio
 import contextlib
 import logging
+import re
 import tempfile
 import typing
 from collections.abc import AsyncIterator
 from functools import partial
 from typing import override
 
-from pychromecast import Chromecast
-from pychromecast.controllers.media import MediaController
 from starlette.applications import Starlette
 from starlette.middleware import Middleware
 from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseEndpoint
 from starlette.middleware.cors import CORSMiddleware
 from starlette.middleware.gzip import GZipMiddleware
 from starlette.requests import Request
-from starlette.responses import Response
+from starlette.responses import JSONResponse, Response
 from starlette.routing import Route
 from starlette.staticfiles import StaticFiles
 
-from p_cast.cast import find_chromecast, get_local_ip, subscribe_to_stream
+from pychromecast.discovery import CastBrowser
+
+from p_cast.cast import find_chromecasts, get_local_ip, subscribe_to_stream
 from p_cast.config import StreamConfig
-from p_cast.device import SinkController
+from p_cast.device import SinkController, SinkInputMonitor
 from p_cast.ffmpeg import create_ffmpeg_stream_command
 
 logger = logging.getLogger(__name__)
 
+_SINK_NAME_INVALID_CHARS = re.compile(r"[^a-zA-Z0-9_-]")
+
+
+def _make_sink_name(friendly_name: str) -> str:
+    sanitized = _SINK_NAME_INVALID_CHARS.sub("_", friendly_name)
+    return f"{sanitized}_Cast"
+
 
 class StaticFilesWithCORS(BaseHTTPMiddleware):
+    """Wraps StaticFiles to add CORS headers and disable caching on HLS segment responses."""
     @override
     async def dispatch(
         self,
@@ -59,70 +68,194 @@ class StaticFilesWithCORS(BaseHTTPMiddleware):
         return response
 
 
+class ActiveStream:
+    """Holds all resources for a running stream (FFmpeg process, temp dir, Starlette mount).
+
+    Torn down as a unit when the sink is deactivated or the app shuts down.
+    """
+
+    def __init__(
+        self,
+        ffmpeg_process: asyncio.subprocess.Process,
+        stream_dir: tempfile.TemporaryDirectory[str],
+        stream_app: StaticFilesWithCORS,
+        subscribe_task: asyncio.Task[None],
+        volume_controller: SinkController,
+    ) -> None:
+        self.ffmpeg_process = ffmpeg_process
+        self.stream_dir = stream_dir
+        self.stream_app = stream_app
+        self.subscribe_task = subscribe_task
+        self.volume_controller = volume_controller
+
+    async def teardown(self) -> None:
+        self.subscribe_task.cancel()
+        if self.ffmpeg_process.returncode is None:
+            self.ffmpeg_process.terminate()
+            await self.ffmpeg_process.wait()
+        await self.volume_controller.stop_volume_sync()
+        self.stream_dir.cleanup()
+
+
 @contextlib.asynccontextmanager
 async def lifespan(
     app: Starlette,
-    chromecast: Chromecast,
+    controllers: dict[str, SinkController],
+    stream_config: StreamConfig,
+    browser: CastBrowser,
 ) -> AsyncIterator[None]:
-    sink_controller = SinkController(chromecast=chromecast)
-    await sink_controller.init()
+    for controller in controllers.values():
+        await controller.init()
 
-    stream_config = StreamConfig(acodec="aac", bitrate="256k")
+    active_stream: ActiveStream | None = None
+    local_ip = get_local_ip()
 
-    app.state.media_controller = chromecast
+    async def on_activate(sink_name: str) -> None:
+        nonlocal active_stream
 
-    async def subscribe(mc: MediaController, local_ip: str) -> None:
-        await asyncio.sleep(2)
-        subscribe_to_stream(mc, local_ip, stream_config)
+        controller = controllers[sink_name]
+        cast = controller._cast
+        cast.wait()
 
-    with tempfile.TemporaryDirectory() as stream_dir:
-        sink = await sink_controller.get_sink_name()
-        logger.info("Casting from sink: %s", sink)
+        stream_dir = tempfile.TemporaryDirectory()  # noqa: SIM115
+
+        sink = await controller.get_sink_name()
+        logger.info("Activating cast from sink: %s", sink)
+
         ffmpeg_command = create_ffmpeg_stream_command(
             sink=f"{sink}.monitor",
-            stream_dir=stream_dir,
+            stream_dir=stream_dir.name,
             config=stream_config,
         )
         logger.info("Starting ffmpeg: %s", " ".join(ffmpeg_command))
 
-        await asyncio.create_subprocess_exec(*ffmpeg_command)
+        ffmpeg_process = await asyncio.create_subprocess_exec(
+            *ffmpeg_command,
+            stderr=asyncio.subprocess.PIPE,
+        )
 
-        stream_app = StaticFilesWithCORS(StaticFiles(directory=stream_dir))
+        # Give FFmpeg a moment to fail on startup errors (missing libs, bad args)
+        await asyncio.sleep(0.5)
+        if ffmpeg_process.returncode is not None:
+            stderr = await ffmpeg_process.stderr.read() if ffmpeg_process.stderr else b""
+            logger.error(
+                "FFmpeg exited immediately (code %d): %s",
+                ffmpeg_process.returncode,
+                stderr.decode(errors="replace").strip(),
+            )
+            stream_dir.cleanup()
+            return
 
+        stream_app = StaticFilesWithCORS(StaticFiles(directory=stream_dir.name))
         app.mount("/stream", stream_app)
 
-        local_ip = get_local_ip()
+        async def subscribe() -> None:
+            await asyncio.sleep(2)
+            subscribe_to_stream(cast.media_controller, local_ip, stream_config)
 
-        task = asyncio.create_task(subscribe(chromecast.media_controller, local_ip))
+        subscribe_task = asyncio.create_task(subscribe())
 
-        yield
+        await controller.start_volume_sync()
 
-        task.cancel()
-        await sink_controller.close()
+        active_stream = ActiveStream(
+            ffmpeg_process=ffmpeg_process,
+            stream_dir=stream_dir,
+            stream_app=stream_app,
+            subscribe_task=subscribe_task,
+            volume_controller=controller,
+        )
+
+        app.state.active_controller = controller
+
+    async def on_deactivate(sink_name: str) -> None:
+        nonlocal active_stream
+
+        if active_stream is not None:
+            logger.info("Deactivating cast from sink: %s", sink_name)
+            await active_stream.teardown()
+            app.routes[:] = [
+                r for r in app.routes if not (hasattr(r, "path") and r.path == "/stream")  # type: ignore[union-attr]
+            ]
+            active_stream = None
+            app.state.active_controller = None
+
+    monitor = SinkInputMonitor(
+        controllers=controllers,
+        on_activate=on_activate,
+        on_deactivate=on_deactivate,
+    )
+    await monitor.start()
+
+    app.state.controllers = controllers
+    app.state.monitor = monitor
+    app.state.active_controller = None
+
+    yield
+
+    if active_stream is not None:
+        await active_stream.teardown()
+    await monitor.stop()
+    for controller in controllers.values():
+        await controller.close()
+    browser.stop_discovery()
 
 
-def get_media_controller(request: Request) -> MediaController:
-    return typing.cast("MediaController", request.app.state.media_controller)  # pyright: ignore[reportAny]
+def get_active_media_controller(request: Request):  # type: ignore[no-untyped-def]  # noqa: ANN201
+    controller: SinkController | None = request.app.state.active_controller  # pyright: ignore[reportAny]
+    if controller is None:
+        return None
+    return controller._cast.media_controller
 
 
 async def pause(request: Request) -> Response:
-    media_controller = get_media_controller(request)
+    media_controller = get_active_media_controller(request)
+    if media_controller is None:
+        return Response(content="No active device", status_code=404)
     media_controller.pause()
     return Response(content="OK")
 
 
 async def play(request: Request) -> Response:
-    media_controller = get_media_controller(request)
+    media_controller = get_active_media_controller(request)
+    if media_controller is None:
+        return Response(content="No active device", status_code=404)
     media_controller.play()
     media_controller.seek(None)  # type: ignore[arg-type] # pyright: ignore[reportArgumentType]
     return Response(content="OK")
 
 
+async def devices(request: Request) -> Response:
+    controllers: dict[str, SinkController] = request.app.state.controllers  # pyright: ignore[reportAny]
+    monitor: SinkInputMonitor = request.app.state.monitor  # pyright: ignore[reportAny]
+    active_sink = monitor.active_sink
+
+    device_list = [
+        {
+            "sink_name": sink_name,
+            "friendly_name": controller._cast.name,
+            "active": sink_name == active_sink,
+        }
+        for sink_name, controller in controllers.items()
+    ]
+    return JSONResponse(device_list)
+
+
 def create_app() -> Starlette:
     logging.basicConfig(level=logging.DEBUG)
     logging.getLogger(__name__).setLevel(logging.INFO)
-    # logger = logging.getLogger(__name__)
-    chromecast = find_chromecast()
+
+    chromecasts, browser = find_chromecasts()
+
+    stream_config = StreamConfig(acodec="aac", bitrate="256k")
+
+    controllers: dict[str, SinkController] = {}
+    for cast in chromecasts:
+        sink_name = _make_sink_name(cast.name)
+        controllers[sink_name] = SinkController(
+            chromecast=cast,
+            sink_name=sink_name,
+        )
+        logger.info("Registered device: %s -> sink %s", cast.name, sink_name)
 
     middleware = [
         Middleware(
@@ -143,7 +276,13 @@ def create_app() -> Starlette:
         routes=[
             Route("/pause", endpoint=pause),
             Route("/play", endpoint=play),
+            Route("/devices", endpoint=devices),
         ],
-        lifespan=partial(lifespan, chromecast=chromecast),
+        lifespan=partial(
+            lifespan,
+            controllers=controllers,
+            stream_config=stream_config,
+            browser=browser,
+        ),
         middleware=middleware,
     )

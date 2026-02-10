@@ -27,10 +27,12 @@ sample_rates: dict[AudioCodec, list[int]] = {
 
 @dataclass
 class StreamConfig:
+    """Audio encoding and HLS output parameters for the FFmpeg streaming pipeline."""
     acodec: AudioCodec = "aac"
     bitrate: str = "192k"
     sampling_frequency: int = 48000
     hls_segment_type: HlsSegmentType = "mpegts"
+    ffmpeg_bin: str = "ffmpeg"
 
     def __post_init__(self) -> None:
         if self.sampling_frequency not in sample_rates.get(self.acodec, []):
@@ -44,3 +46,7 @@ class StreamConfig:
                 return "ts_aac"
             case "fmp4":
                 return "fmp4"
+
+    @property
+    def content_type(self) -> str:
+        return "application/vnd.apple.mpegurl"

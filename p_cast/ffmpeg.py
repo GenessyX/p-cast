@@ -1,5 +1,7 @@
 from p_cast.config import StreamConfig
 
+# note, the ffmpeg executable is required, and it must support the pulse input format (--enable). check with `ffmpeg -formats | grep pulse`.
+
 
 def create_ffmpeg_stream_command(
     sink: str,
@@ -13,7 +15,7 @@ def create_ffmpeg_stream_command(
     if config.acodec == "aac":
         acodec = ["-c:a", "aac", "-profile:a", "aac_low"]
     return [
-        "ffmpeg",
+        config.ffmpeg_bin,
         "-y",
         "-loglevel",
         "quiet",
