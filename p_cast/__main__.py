@@ -26,7 +26,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Cast audio from PipeWire to Chromecast")
     parser.add_argument("-b", "--bitrate", default="256k", help="audio bitrate (default: 256k)")
     parser.add_argument("-p", "--port", type=int, default=3000, help="streaming server tcp port (default: 3000)")
-    parser.add_argument("--ffmpeg", default="ffmpeg", help="path to ffmpeg binary (default: ffmpeg)")
+    parser.add_argument("--ffmpeg", default="ffmpeg", help="path to ffmpeg binary supporting 'pulse' format (default: ffmpeg)")
     parser.add_argument(
         "--log-level",
         default="INFO",
