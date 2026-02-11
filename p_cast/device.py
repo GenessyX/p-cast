@@ -274,14 +274,19 @@ class SinkInputMonitor:
             sink_idx: int = si.sink  # pyright: ignore[reportAttributeAccessIssue, reportAssignmentType]
             if sink_idx in self._our_sink_indices:
                 sink_name = self._sink_indices[sink_idx]
-                self._active_sink_inputs.add(sink_input_index)
                 self._cancel_deferred_deactivation()
                 if self._active_sink != sink_name:
                     if self._active_sink is not None:
+                        logger.info(
+                            "Switching from %s to %s (only one sink can stream at a time)",
+                            self._active_sink, sink_name,
+                        )
                         await self._on_deactivate(self._active_sink)
                     self._active_sink = sink_name
+                    self._active_sink_inputs.clear()
                     logger.info("Sink activated: %s", sink_name)
                     await self._on_activate(sink_name)
+                self._active_sink_inputs.add(sink_input_index)
             elif sink_input_index in self._active_sink_inputs:
                 # Sink-input moved away from our sink to a non-monitored sink
                 self._active_sink_inputs.discard(sink_input_index)
