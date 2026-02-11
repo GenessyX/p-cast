@@ -2,7 +2,6 @@ import asyncio
 import contextlib
 import logging
 import os
-import re
 import tempfile
 import typing
 from collections.abc import AsyncIterator, Callable, Coroutine
@@ -34,15 +33,6 @@ from p_cast.ffmpeg import create_ffmpeg_stream_command
 
 logger = logging.getLogger(__name__)
 
-_SINK_NAME_INVALID_CHARS = re.compile(r"[^a-zA-Z0-9_-]")
-
-
-def _make_sink_name(chromecast_name: str) -> str:
-    sanitized = _SINK_NAME_INVALID_CHARS.sub("_", chromecast_name).lower()
-    return f"{sanitized}_cast"
-
-def _make_friendly_sink_name(chromecast_name: str) -> str:
-    return f"{chromecast_name} Cast"
 
 class StaticFilesWithCORS(BaseHTTPMiddleware):
     """Wraps StaticFiles to add CORS headers and disable caching on HLS segment responses."""
@@ -316,13 +306,10 @@ async def lifespan(
         cast = discovery.create_chromecast(device_id)
         if cast is None:
             return
-        sink_name = _make_sink_name(cast.name)
-        sink_friendly_name = _make_friendly_sink_name(cast.name)
-        controller = SinkController(chromecast=cast, sink_name=sink_name, sink_friendly_name=sink_friendly_name)
+        controller = SinkController(chromecast=cast, cast_name=cast.name)
         await controller.init()
-        controllers[sink_name] = controller
+        controllers[controller._sink_name] = controller
         await monitor.refresh_sink_indices()
-        logger.info("New device added: %s -> sink %s", cast.name, sink_name)
 
     async def handle_device_remove(device_id: UUID) -> None:
         for sink_name, controller in controllers.items():
@@ -393,30 +380,28 @@ async def devices(request: Request) -> Response:
 
 def create_app() -> Starlette:
     # should all be set in main()
-    assert all(v in os.environ for v in ("P_CAST_LOG_LEVEL", "P_CAST_PORT", "P_CAST_BITRATE", "P_CAST_FFMPEG"))
-    log_level = getattr(logging, os.environ["P_CAST_LOG_LEVEL"], logging.INFO)
+    assert all(v in os.environ for v in ("PCAST_LOG_LEVEL", "PCAST_PORT", "PCAST_BITRATE", "PCAST_FFMPEG"))
+
+    log_level = getattr(logging, os.environ["PCAST_LOG_LEVEL"], logging.INFO)
     logging.basicConfig(level=log_level, format="%(asctime)s %(levelname)s:%(name)s:%(message)s")
 
     discovery = CastDiscovery()
     chromecasts = discovery.discover()
 
-    streaming_port = int(os.environ["P_CAST_PORT"])
+    streaming_port = int(os.environ["PCAST_PORT"])
     stream_config = StreamConfig(
         acodec="aac",
-        bitrate=os.environ["P_CAST_BITRATE"],
-        ffmpeg_bin=os.environ["P_CAST_FFMPEG"],
+        bitrate=os.environ["PCAST_BITRATE"],
+        ffmpeg_bin=os.environ["PCAST_FFMPEG"],
     )
 
     controllers: dict[str, SinkController] = {}
     for cast in chromecasts:
-        sink_name = _make_sink_name(cast.name)
-        sink_friendly_name = _make_friendly_sink_name(cast.name)
-        controllers[sink_name] = SinkController(
+        controller = SinkController(
             chromecast=cast,
-            sink_name=sink_name,
-            sink_friendly_name=sink_friendly_name,
+            cast_name=cast.name,
         )
-        logger.info("Registered device: %s -> sink %s", cast.name, sink_name)
+        controllers[controller._sink_name] = controller
 
     middleware = [
         Middleware(

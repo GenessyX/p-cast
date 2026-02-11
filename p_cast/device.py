@@ -1,6 +1,7 @@
 import asyncio
 import contextlib
 import logging
+import re
 import typing
 from collections.abc import Callable, Coroutine
 
@@ -16,6 +17,16 @@ type ActivationCallback = Callable[[str], Coroutine[None, None, None]]
 type DeactivationCallback = Callable[[str], Coroutine[None, None, None]]
 
 
+_SINK_NAME_INVALID_CHARS = re.compile(r"[^a-zA-Z0-9_-]")
+
+def _make_sink_name(chromecast_name: str) -> str:
+    sanitized = _SINK_NAME_INVALID_CHARS.sub("_", chromecast_name).lower()
+    return f"{sanitized}_cast"
+
+def _make_friendly_sink_name(chromecast_name: str) -> str:
+    return f"{chromecast_name} Cast"
+
+
 class SinkController:
     """Manages a PulseAudio null sink for a single Chromecast device.
 
@@ -26,12 +37,13 @@ class SinkController:
     _sink_module_id: int
     _volume_listener: asyncio.Task[None]
 
-    def __init__(self, chromecast: Chromecast, sink_name: str, sink_friendly_name: str) -> None:
+    def __init__(self, chromecast: Chromecast, cast_name: str) -> None:
         self._cast = chromecast
-        self._sink_name = sink_name
-        self._sink_friendly_name = sink_friendly_name
+        self._sink_name = _make_sink_name(cast_name)
+        self._sink_friendly_name = _make_friendly_sink_name(cast_name)
         self._sink_module_id = -1
         self.available = True
+        logger.info("New device registered: cc %s -> sink %s", cast_name, self._sink_name)
 
     async def init(self) -> None:
         self._pulse = pulsectl_asyncio.PulseAsync(f"p-cast-{self._sink_name}")

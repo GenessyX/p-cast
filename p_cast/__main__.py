@@ -25,7 +25,7 @@ def bitrate_ok(bitrate: str) -> bool:
 def main() -> None:
     parser = argparse.ArgumentParser(description="Cast audio from PipeWire to Chromecast")
     parser.add_argument("-b", "--bitrate", default="256k", help="audio bitrate (default: 256k)")
-    parser.add_argument("-p", "--port", type=int, default=3000, help="streaming server TCP port (default: 3000)")
+    parser.add_argument("-p", "--port", type=int, default=3000, help="streaming server tcp port (default: 3000)")
     parser.add_argument("--ffmpeg", default="ffmpeg", help="path to ffmpeg binary (default: ffmpeg)")
     parser.add_argument(
         "--log-level",
@@ -39,10 +39,10 @@ def main() -> None:
         print("Provided bitrate is invalid or above 320k: ", args.bitrate)
         sys.exit(1)
 
-    os.environ["P_CAST_BITRATE"] = args.bitrate
-    os.environ["P_CAST_PORT"] = str(args.port)
-    os.environ["P_CAST_FFMPEG"] = args.ffmpeg
-    os.environ["P_CAST_LOG_LEVEL"] = args.log_level
+    os.environ["PCAST_BITRATE"] = args.bitrate
+    os.environ["PCAST_PORT"] = str(args.port)
+    os.environ["PCAST_FFMPEG"] = args.ffmpeg
+    os.environ["PCAST_LOG_LEVEL"] = args.log_level
 
     server = Server(
         target="p_cast.app:create_app",
