@@ -14,7 +14,7 @@ P‑Cast captures audio directly from PipeWire / PulseAudio, encodes it with FFm
     ```
 
 - Run once to test (ephemeral install):
-    - using `uvx`:
+    - Using `uvx`:
         ```bash
         uvx p-cast
         ```
@@ -39,11 +39,13 @@ P‑Cast captures audio directly from PipeWire / PulseAudio, encodes it with FFm
     cd p-cast
     python3 -m venv .venv
     source .venv/bin/activate
-    pip install -r requirements.txt
+    pip install .
     python p_cast
     ```
 
 **THEN** while running, under Sound Settings, simply choose the Chromecast device of your choice (set it as default sink or route an app explicitly). Audio will be cast to your device.
+
+Note: Ensure that the chosen port (3000 by default) is open for incoming connections from your Chromecasts.
 
 ## Features
 
@@ -73,7 +75,9 @@ P‑Cast captures audio directly from PipeWire / PulseAudio, encodes it with FFm
 | FFmpeg ≥ 6.1 w/ pulse support | encoding & HLS muxing  |
 | Chromecast        | playback device on same LAN |
 
-Dependencies are declared in **pyproject.toml**. The examples below use [**uv**](https://github.com/astral-sh/uv) but regular `pip` works just as well.
+Dependencies are declared in **pyproject.toml**. We prefer [**uv**](https://github.com/astral-sh/uv) but regular `pip` works just as well.
+
+Your firewall must not block your Chromecast from reaching your chosen local TCP port.
 
 ## Optional: keep PipeWire from re‑connecting to another device
 
