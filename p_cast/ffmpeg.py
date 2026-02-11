@@ -6,6 +6,7 @@ from p_cast.config import StreamConfig
 def create_ffmpeg_stream_command(
     sink: str,
     stream_dir: str,
+    sample_rate: int | None = None,
     config: StreamConfig | None = None,
 ) -> list[str]:
     if config is None:
@@ -14,6 +15,10 @@ def create_ffmpeg_stream_command(
     acodec = []
     if config.acodec == "aac":
         acodec = ["-c:a", "aac", "-profile:a", "aac_low"]
+
+    # resampling is OPTIONAL
+    resample = ["-ar", str(sample_rate)] if sample_rate is not None else []
+
     return [
         config.ffmpeg_bin,
         "-y",
@@ -61,8 +66,7 @@ def create_ffmpeg_stream_command(
         *acodec,
         "-b:a",
         config.bitrate,
-        "-ar",
-        str(config.sampling_frequency),
+        *resample,
         "-fflags",
         "nobuffer",
         "-flags",

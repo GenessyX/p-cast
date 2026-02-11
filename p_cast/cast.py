@@ -111,9 +111,10 @@ def get_local_ip() -> str:
 def subscribe_to_stream(
     mc: MediaController,
     local_ip: str,
+    streaming_port: int,
     config: StreamConfig,
 ) -> None:
-    url = f"http://{local_ip}:3000/stream/index.m3u8"
+    url = f"http://{local_ip}:{streaming_port}/stream/index.m3u8"
     logger.info("Subscribing to: %s", url)
     mc.play_media(
         url,

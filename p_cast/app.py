@@ -1,6 +1,7 @@
 import asyncio
 import contextlib
 import logging
+import os
 import re
 import tempfile
 import typing
@@ -36,10 +37,12 @@ logger = logging.getLogger(__name__)
 _SINK_NAME_INVALID_CHARS = re.compile(r"[^a-zA-Z0-9_-]")
 
 
-def _make_sink_name(friendly_name: str) -> str:
-    sanitized = _SINK_NAME_INVALID_CHARS.sub("_", friendly_name)
-    return f"{sanitized}_Cast"
+def _make_sink_name(chromecast_name: str) -> str:
+    sanitized = _SINK_NAME_INVALID_CHARS.sub("_", chromecast_name).lower()
+    return f"{sanitized}_cast"
 
+def _make_friendly_sink_name(chromecast_name: str) -> str:
+    return f"{chromecast_name} Cast"
 
 class StaticFilesWithCORS(BaseHTTPMiddleware):
     """Wraps StaticFiles to add CORS headers and disable caching on HLS segment responses."""
@@ -149,6 +152,7 @@ async def lifespan(
     controllers: dict[str, SinkController],
     stream_config: StreamConfig,
     discovery: CastDiscovery,
+    streaming_port: int,
 ) -> AsyncIterator[None]:
     for controller in controllers.values():
         await controller.init()
@@ -182,12 +186,20 @@ async def lifespan(
         ffmpeg_watcher: asyncio.Task[None] | None = None
 
         try:
-            sink = await controller.get_sink_name()
+            sink_info = await controller.get_sink()
+            sink = sink_info.name  # pyright: ignore[reportAttributeAccessIssue]
             logger.info("Activating cast from sink: %s", sink)
+
+            # Generally don't resample pipewire streams; use the same rate pipewire uses (configurable in pipewire.conf)
+            # Only resample if PipeWire's rate exceeds Chromecast's max (96kHz)
+            from p_cast.config import MAX_SAMPLE_RATE
+            pw_rate: int = sink_info.sample_spec.rate  # pyright: ignore[reportAttributeAccessIssue, reportAssignmentType]
+            sample_rate = min(pw_rate, MAX_SAMPLE_RATE) if pw_rate > MAX_SAMPLE_RATE else None
 
             ffmpeg_command = create_ffmpeg_stream_command(
                 sink=f"{sink}.monitor",
                 stream_dir=stream_dir.name,
+                sample_rate=sample_rate,
                 config=stream_config,
             )
             logger.info("Starting ffmpeg: %s", " ".join(ffmpeg_command))
@@ -215,7 +227,7 @@ async def lifespan(
             async def subscribe() -> None:
                 await asyncio.sleep(2)
                 try:
-                    subscribe_to_stream(cast.media_controller, local_ip, stream_config)
+                    subscribe_to_stream(cast.media_controller, local_ip, streaming_port, stream_config)
                 except Exception:
                     logger.exception("Failed to subscribe Chromecast to stream")
 
@@ -305,7 +317,8 @@ async def lifespan(
         if cast is None:
             return
         sink_name = _make_sink_name(cast.name)
-        controller = SinkController(chromecast=cast, sink_name=sink_name)
+        sink_friendly_name = _make_friendly_sink_name(cast.name)
+        controller = SinkController(chromecast=cast, sink_name=sink_name, sink_friendly_name=sink_friendly_name)
         await controller.init()
         controllers[sink_name] = controller
         await monitor.refresh_sink_indices()
@@ -379,20 +392,29 @@ async def devices(request: Request) -> Response:
 
 
 def create_app() -> Starlette:
-    logging.basicConfig(level=logging.DEBUG)
-    logging.getLogger(__name__).setLevel(logging.INFO)
+    # should all be set in main()
+    assert all(v in os.environ for v in ("P_CAST_LOG_LEVEL", "P_CAST_PORT", "P_CAST_BITRATE", "P_CAST_FFMPEG"))
+    log_level = getattr(logging, os.environ["P_CAST_LOG_LEVEL"], logging.INFO)
+    logging.basicConfig(level=log_level, format="%(asctime)s %(levelname)s:%(name)s:%(message)s")
 
     discovery = CastDiscovery()
     chromecasts = discovery.discover()
 
-    stream_config = StreamConfig(acodec="aac", bitrate="256k")
+    streaming_port = int(os.environ["P_CAST_PORT"])
+    stream_config = StreamConfig(
+        acodec="aac",
+        bitrate=os.environ["P_CAST_BITRATE"],
+        ffmpeg_bin=os.environ["P_CAST_FFMPEG"],
+    )
 
     controllers: dict[str, SinkController] = {}
     for cast in chromecasts:
         sink_name = _make_sink_name(cast.name)
+        sink_friendly_name = _make_friendly_sink_name(cast.name)
         controllers[sink_name] = SinkController(
             chromecast=cast,
             sink_name=sink_name,
+            sink_friendly_name=sink_friendly_name,
         )
         logger.info("Registered device: %s -> sink %s", cast.name, sink_name)
 
@@ -422,6 +444,7 @@ def create_app() -> Starlette:
             controllers=controllers,
             stream_config=stream_config,
             discovery=discovery,
+            streaming_port=streaming_port,
         ),
         middleware=middleware,
     )

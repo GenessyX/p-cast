@@ -26,16 +26,17 @@ class SinkController:
     _sink_module_id: int
     _volume_listener: asyncio.Task[None]
 
-    def __init__(self, chromecast: Chromecast, sink_name: str) -> None:
+    def __init__(self, chromecast: Chromecast, sink_name: str, sink_friendly_name: str) -> None:
         self._cast = chromecast
         self._sink_name = sink_name
+        self._sink_friendly_name = sink_friendly_name
         self._sink_module_id = -1
         self.available = True
 
     async def init(self) -> None:
         self._pulse = pulsectl_asyncio.PulseAsync(f"p-cast-{self._sink_name}")
         await self._pulse.connect()
-        self._sink_module_id = await self.create_sink(self._sink_name)
+        self._sink_module_id = await self.create_sink(self._sink_name, self._sink_friendly_name)
 
     async def start_volume_sync(self) -> None:
         self._volume_listener = asyncio.create_task(self._subscribe_volume())
@@ -53,9 +54,9 @@ class SinkController:
         if hasattr(self, "_volume_listener"):
             self._volume_listener.cancel()
 
-    async def create_sink(self, name: str) -> int:
+    async def create_sink(self, name: str, friendly_name: str) -> int:
         sink_properties = [
-            f"device.description={name}",
+            f"device.description='{friendly_name}'",
             "channelmix.min-volume=5.0",
             "channelmix.max-volume=5.0",
             "channelmix.normalize=true",
