@@ -49,7 +49,8 @@ class StaticFilesWithCORS(BaseHTTPMiddleware):
 
         response: Response = await call_next(request)
 
-        content_length = int(response.headers["Content-Length"]) / 1024
+        raw_length = response.headers.get("content-length")
+        content_length = int(raw_length) / 1024 if raw_length else 0
 
         logger.debug(
             "[%s:%s] %s - %s - %s KiB",
@@ -63,8 +64,9 @@ class StaticFilesWithCORS(BaseHTTPMiddleware):
         response.headers["Access-Control-Allow-Credentials"] = "true"
         response.headers["Cache-Control"] = "no-cache"
 
-        del response.headers["etag"]
-        del response.headers["accept-ranges"]
+        for header in ("etag", "accept-ranges"):
+            if header in response.headers:
+                del response.headers[header]
         return response
 
 
@@ -81,19 +83,25 @@ class ActiveStream:
         stream_app: StaticFilesWithCORS,
         subscribe_task: asyncio.Task[None],
         volume_controller: SinkController,
+        ffmpeg_watcher: asyncio.Task[None],
     ) -> None:
         self.ffmpeg_process = ffmpeg_process
         self.stream_dir = stream_dir
         self.stream_app = stream_app
         self.subscribe_task = subscribe_task
         self.volume_controller = volume_controller
+        self.ffmpeg_watcher = ffmpeg_watcher
 
     async def teardown(self) -> None:
         self.subscribe_task.cancel()
+        self.ffmpeg_watcher.cancel()
         if self.ffmpeg_process.returncode is None:
             self.ffmpeg_process.terminate()
             await self.ffmpeg_process.wait()
-        await self.volume_controller.stop_volume_sync()
+        try:
+            await self.volume_controller.stop_volume_sync()
+        except Exception:
+            logger.warning("Error stopping volume sync during teardown", exc_info=True)
         self.stream_dir.cleanup()
 
 
@@ -115,57 +123,97 @@ async def lifespan(
 
         controller = controllers[sink_name]
         cast = controller._cast
-        cast.wait()
+        await asyncio.to_thread(cast.wait)
 
         stream_dir = tempfile.TemporaryDirectory()  # noqa: SIM115
+        ffmpeg_process: asyncio.subprocess.Process | None = None
+        subscribe_task: asyncio.Task[None] | None = None
+        ffmpeg_watcher: asyncio.Task[None] | None = None
 
-        sink = await controller.get_sink_name()
-        logger.info("Activating cast from sink: %s", sink)
+        try:
+            sink = await controller.get_sink_name()
+            logger.info("Activating cast from sink: %s", sink)
 
-        ffmpeg_command = create_ffmpeg_stream_command(
-            sink=f"{sink}.monitor",
-            stream_dir=stream_dir.name,
-            config=stream_config,
-        )
-        logger.info("Starting ffmpeg: %s", " ".join(ffmpeg_command))
-
-        ffmpeg_process = await asyncio.create_subprocess_exec(
-            *ffmpeg_command,
-            stderr=asyncio.subprocess.PIPE,
-        )
-
-        # Give FFmpeg a moment to fail on startup errors (missing libs, bad args)
-        await asyncio.sleep(0.5)
-        if ffmpeg_process.returncode is not None:
-            stderr = await ffmpeg_process.stderr.read() if ffmpeg_process.stderr else b""
-            logger.error(
-                "FFmpeg exited immediately (code %d): %s",
-                ffmpeg_process.returncode,
-                stderr.decode(errors="replace").strip(),
+            ffmpeg_command = create_ffmpeg_stream_command(
+                sink=f"{sink}.monitor",
+                stream_dir=stream_dir.name,
+                config=stream_config,
             )
+            logger.info("Starting ffmpeg: %s", " ".join(ffmpeg_command))
+
+            ffmpeg_process = await asyncio.create_subprocess_exec(
+                *ffmpeg_command,
+                stderr=asyncio.subprocess.PIPE,
+            )
+
+            # Give FFmpeg a moment to fail on startup errors (missing libs, bad args)
+            await asyncio.sleep(0.5)
+            if ffmpeg_process.returncode is not None:
+                stderr = await ffmpeg_process.stderr.read() if ffmpeg_process.stderr else b""
+                logger.error(
+                    "FFmpeg exited immediately (code %d): %s",
+                    ffmpeg_process.returncode,
+                    stderr.decode(errors="replace").strip(),
+                )
+                stream_dir.cleanup()
+                return
+
+            stream_app = StaticFilesWithCORS(StaticFiles(directory=stream_dir.name))
+            app.mount("/stream", stream_app)
+
+            async def subscribe() -> None:
+                await asyncio.sleep(2)
+                try:
+                    subscribe_to_stream(cast.media_controller, local_ip, stream_config)
+                except Exception:
+                    logger.exception("Failed to subscribe Chromecast to stream")
+
+            subscribe_task = asyncio.create_task(subscribe())
+
+            async def watch_ffmpeg() -> None:
+                assert ffmpeg_process is not None
+                await ffmpeg_process.wait()
+                if active_stream is not None and active_stream.ffmpeg_process is ffmpeg_process:
+                    stderr_data = b""
+                    if ffmpeg_process.stderr:
+                        stderr_data = await ffmpeg_process.stderr.read()
+                    logger.error(
+                        "FFmpeg exited unexpectedly (code %d): %s",
+                        ffmpeg_process.returncode,
+                        stderr_data.decode(errors="replace").strip(),
+                    )
+                    # in this case, audio is still routed to the sink but not sent to chromecast. The user will notice silence and can switch from/back to the sink to retry.
+                    await on_deactivate(sink_name)
+                    # Reset monitor state so re-detection can also happen on the
+                    # next PulseAudio event (e.g. new sink-input or volume change)
+                    monitor.clear_active()
+
+
+            ffmpeg_watcher = asyncio.create_task(watch_ffmpeg())
+
+            await controller.start_volume_sync()
+
+            active_stream = ActiveStream(
+                ffmpeg_process=ffmpeg_process,
+                stream_dir=stream_dir,
+                stream_app=stream_app,
+                subscribe_task=subscribe_task,
+                volume_controller=controller,
+                ffmpeg_watcher=ffmpeg_watcher,
+            )
+
+            app.state.active_controller = controller
+
+        except Exception:
+            logger.exception("Failed to activate stream for sink: %s", sink_name)
+            if subscribe_task is not None:
+                subscribe_task.cancel()
+            if ffmpeg_watcher is not None:
+                ffmpeg_watcher.cancel()
+            if ffmpeg_process is not None and ffmpeg_process.returncode is None:
+                ffmpeg_process.terminate()
+                await ffmpeg_process.wait()
             stream_dir.cleanup()
-            return
-
-        stream_app = StaticFilesWithCORS(StaticFiles(directory=stream_dir.name))
-        app.mount("/stream", stream_app)
-
-        async def subscribe() -> None:
-            await asyncio.sleep(2)
-            subscribe_to_stream(cast.media_controller, local_ip, stream_config)
-
-        subscribe_task = asyncio.create_task(subscribe())
-
-        await controller.start_volume_sync()
-
-        active_stream = ActiveStream(
-            ffmpeg_process=ffmpeg_process,
-            stream_dir=stream_dir,
-            stream_app=stream_app,
-            subscribe_task=subscribe_task,
-            volume_controller=controller,
-        )
-
-        app.state.active_controller = controller
 
     async def on_deactivate(sink_name: str) -> None:
         nonlocal active_stream

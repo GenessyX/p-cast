@@ -1,4 +1,5 @@
 import asyncio
+import contextlib
 import logging
 import typing
 from collections.abc import Callable, Coroutine
@@ -37,6 +38,15 @@ class SinkController:
 
     async def start_volume_sync(self) -> None:
         self._volume_listener = asyncio.create_task(self._subscribe_volume())
+        self._volume_listener.add_done_callback(self._on_volume_listener_done)
+
+    @staticmethod
+    def _on_volume_listener_done(task: asyncio.Task[None]) -> None:
+        if task.cancelled():
+            return
+        exc = task.exception()
+        if exc is not None:
+            logger.error("Volume sync crashed: %s", exc, exc_info=exc)
 
     async def stop_volume_sync(self) -> None:
         if hasattr(self, "_volume_listener"):
@@ -74,9 +84,18 @@ class SinkController:
         return sink.name  # pyright: ignore[reportAttributeAccessIssue]
 
     async def close(self) -> None:
-        await self._pulse.module_unload(self._sink_module_id)
         if hasattr(self, "_volume_listener"):
             self._volume_listener.cancel()
+        try:
+            await self._pulse.module_unload(self._sink_module_id)
+        except Exception:
+            logger.warning(
+                "Failed to unload PA module %d for sink %s",
+                self._sink_module_id,
+                self._sink_name,
+                exc_info=True,
+            )
+        self._pulse.close()
 
     def get_volume(self, sink: pulsectl.PulseSinkInfo) -> float:
         return typing.cast("int", sink.volume.values[0])
@@ -100,12 +119,15 @@ class SinkController:
             changed_sink = await self.get_sink()
             changed_volume = self.get_volume(changed_sink)
             changed_mute = self.get_mute(changed_sink)
-            if changed_volume != current_volume:
-                self._cast.set_volume(volume=changed_volume)
-                current_volume = changed_volume
-            if changed_mute != current_mute:
-                self._cast.set_volume_muted(muted=changed_mute)
-                current_mute = changed_mute
+            try:
+                if changed_volume != current_volume:
+                    self._cast.set_volume(volume=changed_volume)
+                    current_volume = changed_volume
+                if changed_mute != current_mute:
+                    self._cast.set_volume_muted(muted=changed_mute)
+                    current_mute = changed_mute
+            except Exception:
+                logger.warning("Failed to sync volume to Chromecast", exc_info=True)
 
 
 class SinkInputMonitor:
@@ -147,6 +169,8 @@ class SinkInputMonitor:
     async def stop(self) -> None:
         if hasattr(self, "_task"):
             self._task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._task
         if hasattr(self, "_pulse"):
             self._pulse.close()
         if hasattr(self, "_query_pulse"):
@@ -229,6 +253,11 @@ class SinkInputMonitor:
             logger.info("Sink deactivated: %s", self._active_sink)
             await self._on_deactivate(self._active_sink)
             self._active_sink = None
+
+    def clear_active(self) -> None:
+        """Reset active state so the monitor can re-detect existing sink-inputs."""
+        self._active_sink = None
+        self._active_sink_inputs.clear()
 
     @property
     def active_sink(self) -> str | None:
