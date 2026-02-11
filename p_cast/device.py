@@ -30,6 +30,7 @@ class SinkController:
         self._cast = chromecast
         self._sink_name = sink_name
         self._sink_module_id = -1
+        self.available = True
 
     async def init(self) -> None:
         self._pulse = pulsectl_asyncio.PulseAsync(f"p-cast-{self._sink_name}")
@@ -149,6 +150,8 @@ class SinkInputMonitor:
         self._on_deactivate = on_deactivate
         self._active_sink: str | None = None
         self._active_sink_inputs: set[int] = set()
+        self._sink_indices: dict[int, str] = {}
+        self._our_sink_indices: set[int] = set()
 
     async def start(self) -> None:
         self._pulse = pulsectl_asyncio.PulseAsync("p-cast-monitor")
@@ -176,20 +179,44 @@ class SinkInputMonitor:
         if hasattr(self, "_query_pulse"):
             self._query_pulse.close()
 
-    async def _get_sink_indices(self) -> dict[int, str]:
+    async def refresh_sink_indices(self) -> None:
+        """Re-query all controllers to rebuild the sink index mapping."""
         mapping: dict[int, str] = {}
         for sink_name, controller in self._controllers.items():
-            sink = await controller.get_sink()
-            mapping[sink.index] = sink_name  # pyright: ignore[reportAttributeAccessIssue]
-        return mapping
+            try:
+                sink = await controller.get_sink()
+                mapping[sink.index] = sink_name  # pyright: ignore[reportAttributeAccessIssue]
+            except Exception:
+                logger.warning("Failed to get sink for %s", sink_name, exc_info=True)
+        self._sink_indices = mapping
+        self._our_sink_indices = set(mapping.keys())
+
+    async def _check_existing_sink_inputs(self) -> None:
+        """Scan existing sink-inputs for any already routed to our sinks."""
+        sink_inputs = typing.cast(
+            "list[pulsectl.PulseSinkInputInfo]",
+            await self._query_pulse.sink_input_list(),
+        )
+        for si in sink_inputs:
+            sink_idx: int = si.sink  # pyright: ignore[reportAttributeAccessIssue, reportAssignmentType]
+            if sink_idx in self._our_sink_indices:
+                sink_name = self._sink_indices[sink_idx]
+                self._active_sink_inputs.add(si.index)  # pyright: ignore[reportAttributeAccessIssue]
+                if self._active_sink != sink_name:
+                    if self._active_sink is not None:
+                        await self._on_deactivate(self._active_sink)
+                    self._active_sink = sink_name
+                    logger.info("Existing sink-input detected on: %s", sink_name)
+                    await self._on_activate(sink_name)
 
     async def _monitor(self) -> None:
-        sink_indices = await self._get_sink_indices()
-        our_sink_indices = set(sink_indices.keys())
+        await self.refresh_sink_indices()
         logger.info(
             "Sink-input monitor started, watching sink indices: %s",
-            {idx: name for idx, name in sink_indices.items()},
+            {idx: name for idx, name in self._sink_indices.items()},
         )
+
+        await self._check_existing_sink_inputs()
 
         async for event in self._pulse.subscribe_events(
             pulsectl.PulseEventMaskEnum.sink_input,  # pyright: ignore[reportAttributeAccessIssue]
@@ -199,14 +226,10 @@ class SinkInputMonitor:
             if event.t == pulsectl.PulseEventTypeEnum.new:  # pyright: ignore[reportAttributeAccessIssue]
                 await self._handle_sink_input_update(
                     event.index,  # pyright: ignore[reportAttributeAccessIssue]
-                    our_sink_indices,
-                    sink_indices,
                 )
             elif event.t == pulsectl.PulseEventTypeEnum.change:  # pyright: ignore[reportAttributeAccessIssue]
                 await self._handle_sink_input_update(
                     event.index,  # pyright: ignore[reportAttributeAccessIssue]
-                    our_sink_indices,
-                    sink_indices,
                 )
             elif event.t == pulsectl.PulseEventTypeEnum.remove:  # pyright: ignore[reportAttributeAccessIssue]
                 await self._handle_removed_sink_input(
@@ -216,8 +239,6 @@ class SinkInputMonitor:
     async def _handle_sink_input_update(
         self,
         sink_input_index: int,
-        our_sink_indices: set[int],
-        sink_indices: dict[int, str],
     ) -> None:
         sink_inputs = typing.cast(
             "list[pulsectl.PulseSinkInputInfo]",
@@ -227,8 +248,8 @@ class SinkInputMonitor:
             if si.index != sink_input_index:  # pyright: ignore[reportAttributeAccessIssue]
                 continue
             sink_idx: int = si.sink  # pyright: ignore[reportAttributeAccessIssue, reportAssignmentType]
-            if sink_idx in our_sink_indices:
-                sink_name = sink_indices[sink_idx]
+            if sink_idx in self._our_sink_indices:
+                sink_name = self._sink_indices[sink_idx]
                 self._active_sink_inputs.add(sink_input_index)
                 if self._active_sink != sink_name:
                     if self._active_sink is not None:

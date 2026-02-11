@@ -4,9 +4,10 @@ import logging
 import re
 import tempfile
 import typing
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable, Coroutine
 from functools import partial
 from typing import override
+from uuid import UUID
 
 from starlette.applications import Starlette
 from starlette.middleware import Middleware
@@ -18,9 +19,14 @@ from starlette.responses import JSONResponse, Response
 from starlette.routing import Route
 from starlette.staticfiles import StaticFiles
 
-from pychromecast.discovery import CastBrowser
+from pychromecast.socket_client import (
+    ConnectionStatus,
+    ConnectionStatusListener,
+    CONNECTION_STATUS_DISCONNECTED,
+    CONNECTION_STATUS_LOST,
+)
 
-from p_cast.cast import find_chromecasts, get_local_ip, subscribe_to_stream
+from p_cast.cast import CastDiscovery, get_local_ip, subscribe_to_stream
 from p_cast.config import StreamConfig
 from p_cast.device import SinkController, SinkInputMonitor
 from p_cast.ffmpeg import create_ffmpeg_stream_command
@@ -70,6 +76,35 @@ class StaticFilesWithCORS(BaseHTTPMiddleware):
         return response
 
 
+class CastConnectionListener(ConnectionStatusListener):
+    """Detects Chromecast connection loss and triggers stream teardown."""
+
+    def __init__(
+        self,
+        loop: asyncio.AbstractEventLoop,
+        sink_name: str,
+        on_disconnect: Callable[[str], Coroutine[None, None, None]],
+    ) -> None:
+        self._loop = loop
+        self._sink_name = sink_name
+        self._on_disconnect = on_disconnect
+        self._active = True
+
+    def deactivate(self) -> None:
+        self._active = False
+
+    @override
+    def new_connection_status(self, status: ConnectionStatus) -> None:
+        if not self._active:
+            return
+        if status.status in (CONNECTION_STATUS_LOST, CONNECTION_STATUS_DISCONNECTED):
+            logger.warning("Chromecast connection %s: %s", status.status, self._sink_name)
+            asyncio.run_coroutine_threadsafe(
+                self._on_disconnect(self._sink_name),
+                self._loop,
+            )
+
+
 class ActiveStream:
     """Holds all resources for a running stream (FFmpeg process, temp dir, Starlette mount).
 
@@ -84,6 +119,7 @@ class ActiveStream:
         subscribe_task: asyncio.Task[None],
         volume_controller: SinkController,
         ffmpeg_watcher: asyncio.Task[None],
+        connection_listener: CastConnectionListener,
     ) -> None:
         self.ffmpeg_process = ffmpeg_process
         self.stream_dir = stream_dir
@@ -91,8 +127,10 @@ class ActiveStream:
         self.subscribe_task = subscribe_task
         self.volume_controller = volume_controller
         self.ffmpeg_watcher = ffmpeg_watcher
+        self.connection_listener = connection_listener
 
     async def teardown(self) -> None:
+        self.connection_listener.deactivate()
         self.subscribe_task.cancel()
         self.ffmpeg_watcher.cancel()
         if self.ffmpeg_process.returncode is None:
@@ -110,18 +148,31 @@ async def lifespan(
     app: Starlette,
     controllers: dict[str, SinkController],
     stream_config: StreamConfig,
-    browser: CastBrowser,
+    discovery: CastDiscovery,
 ) -> AsyncIterator[None]:
     for controller in controllers.values():
         await controller.init()
 
     active_stream: ActiveStream | None = None
     local_ip = get_local_ip()
+    loop = asyncio.get_running_loop()
+
+    async def handle_cast_disconnect(sink_name: str) -> None:
+        nonlocal active_stream
+        if active_stream is None:
+            return
+        logger.warning("Chromecast disconnected, tearing down: %s", sink_name)
+        await on_deactivate(sink_name)
+        monitor.clear_active()
 
     async def on_activate(sink_name: str) -> None:
         nonlocal active_stream
 
         controller = controllers[sink_name]
+        if not controller.available:
+            logger.warning("Skipping activation for unavailable device: %s", sink_name)
+            return
+
         cast = controller._cast
         await asyncio.to_thread(cast.wait)
 
@@ -193,6 +244,13 @@ async def lifespan(
 
             await controller.start_volume_sync()
 
+            connection_listener = CastConnectionListener(
+                loop=loop,
+                sink_name=sink_name,
+                on_disconnect=handle_cast_disconnect,
+            )
+            cast.register_connection_listener(connection_listener)
+
             active_stream = ActiveStream(
                 ffmpeg_process=ffmpeg_process,
                 stream_dir=stream_dir,
@@ -200,6 +258,7 @@ async def lifespan(
                 subscribe_task=subscribe_task,
                 volume_controller=controller,
                 ffmpeg_watcher=ffmpeg_watcher,
+                connection_listener=connection_listener,
             )
 
             app.state.active_controller = controller
@@ -234,6 +293,36 @@ async def lifespan(
     )
     await monitor.start()
 
+    async def handle_device_add(device_id: UUID) -> None:
+        # Check if controller already exists (device reappearing)
+        for sink_name, controller in controllers.items():
+            if controller._cast.uuid == device_id:
+                controller.available = True
+                logger.info("Device reappeared: %s", sink_name)
+                return
+
+        cast = discovery.create_chromecast(device_id)
+        if cast is None:
+            return
+        sink_name = _make_sink_name(cast.name)
+        controller = SinkController(chromecast=cast, sink_name=sink_name)
+        await controller.init()
+        controllers[sink_name] = controller
+        await monitor.refresh_sink_indices()
+        logger.info("New device added: %s -> sink %s", cast.name, sink_name)
+
+    async def handle_device_remove(device_id: UUID) -> None:
+        for sink_name, controller in controllers.items():
+            if controller._cast.uuid == device_id:
+                controller.available = False
+                logger.info("Device unavailable: %s", sink_name)
+                return
+
+    discovery.set_callbacks(
+        on_add=lambda uuid: asyncio.run_coroutine_threadsafe(handle_device_add(uuid), loop),
+        on_remove=lambda uuid: asyncio.run_coroutine_threadsafe(handle_device_remove(uuid), loop),
+    )
+
     app.state.controllers = controllers
     app.state.monitor = monitor
     app.state.active_controller = None
@@ -245,7 +334,7 @@ async def lifespan(
     await monitor.stop()
     for controller in controllers.values():
         await controller.close()
-    browser.stop_discovery()
+    discovery.stop()
 
 
 def get_active_media_controller(request: Request):  # type: ignore[no-untyped-def]  # noqa: ANN201
@@ -282,6 +371,7 @@ async def devices(request: Request) -> Response:
             "sink_name": sink_name,
             "friendly_name": controller._cast.name,
             "active": sink_name == active_sink,
+            "available": controller.available,
         }
         for sink_name, controller in controllers.items()
     ]
@@ -292,7 +382,8 @@ def create_app() -> Starlette:
     logging.basicConfig(level=logging.DEBUG)
     logging.getLogger(__name__).setLevel(logging.INFO)
 
-    chromecasts, browser = find_chromecasts()
+    discovery = CastDiscovery()
+    chromecasts = discovery.discover()
 
     stream_config = StreamConfig(acodec="aac", bitrate="256k")
 
@@ -330,7 +421,7 @@ def create_app() -> Starlette:
             lifespan,
             controllers=controllers,
             stream_config=stream_config,
-            browser=browser,
+            discovery=discovery,
         ),
         middleware=middleware,
     )

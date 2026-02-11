@@ -3,6 +3,7 @@ import socket
 import sys
 import time
 import typing
+from collections.abc import Callable
 from uuid import UUID
 
 import pychromecast
@@ -18,30 +19,84 @@ from p_cast.config import StreamConfig
 logger = logging.getLogger(__name__)
 
 
-def find_chromecasts() -> tuple[list[pychromecast.Chromecast], CastBrowser]:
-    services: dict[UUID, str] = {}
-    zconf = zeroconf.Zeroconf()
+class CastDiscovery:
+    """Manages Chromecast discovery with persistent add/remove callbacks."""
 
-    def add_callback(device_id: UUID, service: str) -> None:
-        logger.info("[%s] added: %s", device_id, service)
-        services[device_id] = service
+    def __init__(self) -> None:
+        self._zconf = zeroconf.Zeroconf()
+        self._browser: CastBrowser | None = None
+        self._on_add: Callable[[UUID], None] | None = None
+        self._on_remove: Callable[[UUID], None] | None = None
 
-    browser = CastBrowser(
-        SimpleCastListener(
-            add_callback=add_callback,
-        ),
-        zconf,
-    )
-    browser.start_discovery()
-    time.sleep(2)
+    def discover(self) -> list[pychromecast.Chromecast]:
+        """Block for initial discovery, return found Chromecasts."""
+        initial_uuids: set[UUID] = set()
+        initial_phase = True
 
-    chromecasts, browser = pychromecast.get_listed_chromecasts(
-        uuids=list(services.keys()),
-    )
-    if len(chromecasts) == 0:
-        sys.exit(1)
+        def add_callback(device_id: UUID, service: str) -> None:
+            nonlocal initial_phase
+            logger.info("[%s] added: %s", device_id, service)
+            if initial_phase:
+                initial_uuids.add(device_id)
+            elif self._on_add is not None:
+                self._on_add(device_id)
 
-    return chromecasts, browser
+        def remove_callback(device_id: UUID, service: str, cast_info: object) -> None:
+            logger.info("[%s] removed: %s", device_id, service)
+            if self._on_remove is not None:
+                self._on_remove(device_id)
+
+        self._browser = CastBrowser(
+            SimpleCastListener(
+                add_callback=add_callback,
+                remove_callback=remove_callback,
+            ),
+            self._zconf,
+        )
+        self._browser.start_discovery()
+        time.sleep(2)
+        initial_phase = False
+
+        if not initial_uuids:
+            logger.error("No Chromecasts found")
+            sys.exit(1)
+
+        chromecasts: list[pychromecast.Chromecast] = []
+        for uuid in initial_uuids:
+            cast_info = self._browser.devices.get(uuid)
+            if cast_info is None:
+                logger.warning("Device %s disappeared during startup", uuid)
+                continue
+            cc = pychromecast.get_chromecast_from_cast_info(cast_info, self._zconf)
+            chromecasts.append(cc)
+
+        if not chromecasts:
+            logger.error("No Chromecasts could be connected")
+            sys.exit(1)
+
+        return chromecasts
+
+    def set_callbacks(
+        self,
+        on_add: Callable[[UUID], None],
+        on_remove: Callable[[UUID], None],
+    ) -> None:
+        """Register callbacks for devices appearing/disappearing after initial discovery."""
+        self._on_add = on_add
+        self._on_remove = on_remove
+
+    def create_chromecast(self, device_id: UUID) -> pychromecast.Chromecast | None:
+        """Create a Chromecast object for a dynamically discovered device."""
+        if self._browser is None:
+            return None
+        cast_info = self._browser.devices.get(device_id)
+        if cast_info is None:
+            return None
+        return pychromecast.get_chromecast_from_cast_info(cast_info, self._zconf)
+
+    def stop(self) -> None:
+        if self._browser is not None:
+            self._browser.stop_discovery()
 
 
 def get_local_ip() -> str:
@@ -69,4 +124,3 @@ def subscribe_to_stream(
             "hlsSegmentFormat": config.chromecast_hls_segment_type,
         },
     )
-    mc.seek(999999999)
