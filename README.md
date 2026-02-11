@@ -33,8 +33,8 @@ Send audio to **P‑Cast** (set it as default sink or route an app explicitly).
 
 ## Features
 
-* **Virtual sink** - creates virtual null sink P-Cast on the fly.
-* **Automatic device discovery** – finds the first Chromecast on your LAN via mDNS.
+* **Virtual sinks** - creates virtual null sink for each Chromecast device
+* **Automatic device discovery** – finds all Chromecast devices or speaker groups on your LAN via mDNS.
 * **On‑the‑fly transcoding** – AAC @ 256 kbps by default (customisable via env vars).
 * **Live HLS** – 0.5 s segments; Chromecast buffers 3 -> \~3 s end‑to‑end delay.
 * **Volume follow** – changes to the PipeWire sink volume are mirrored to the Chromecast.

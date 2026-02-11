@@ -106,6 +106,23 @@ class SinkController:
 
     async def _subscribe_volume(self) -> None:
         sink = await self.get_sink()
+
+        # Initialize sink volume from Chromecast's current state, ensuring it is at least audible
+        try:
+            cast_volume = self._cast.status.volume_level
+            cast_mute = self._cast.status.volume_muted
+            if cast_mute:
+                self._cast.set_volume_muted(False)
+            if cast_volume is not None and cast_volume < 0.1:
+                self._cast.set_volume(0.1)
+                cast_volume = 0.1
+            if cast_volume is not None:
+                await self._pulse.volume_set_all_chans(sink, cast_volume)
+            await self._pulse.mute(sink, False)
+            sink = await self.get_sink()
+        except Exception:
+            logger.warning("Failed to initialize sink volume from Chromecast", exc_info=True)
+
         current_volume = self.get_volume(sink)
         current_mute = self.get_mute(sink)
 
@@ -152,6 +169,7 @@ class SinkInputMonitor:
         self._active_sink_inputs: set[int] = set()
         self._sink_indices: dict[int, str] = {}
         self._our_sink_indices: set[int] = set()
+        self._deactivation_task: asyncio.Task[None] | None = None
 
     async def start(self) -> None:
         self._pulse = pulsectl_asyncio.PulseAsync("p-cast-monitor")
@@ -169,7 +187,13 @@ class SinkInputMonitor:
         if exc is not None:
             logger.error("Sink-input monitor crashed: %s", exc, exc_info=exc)
 
+    def _cancel_deferred_deactivation(self) -> None:
+        if self._deactivation_task is not None:
+            self._deactivation_task.cancel()
+            self._deactivation_task = None
+
     async def stop(self) -> None:
+        self._cancel_deferred_deactivation()
         if hasattr(self, "_task"):
             self._task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
@@ -251,6 +275,7 @@ class SinkInputMonitor:
             if sink_idx in self._our_sink_indices:
                 sink_name = self._sink_indices[sink_idx]
                 self._active_sink_inputs.add(sink_input_index)
+                self._cancel_deferred_deactivation()
                 if self._active_sink != sink_name:
                     if self._active_sink is not None:
                         await self._on_deactivate(self._active_sink)
@@ -271,12 +296,27 @@ class SinkInputMonitor:
             return
         self._active_sink_inputs.discard(sink_input_index)
         if not self._active_sink_inputs and self._active_sink is not None:
-            logger.info("Sink deactivated: %s", self._active_sink)
-            await self._on_deactivate(self._active_sink)
+            logger.info("Last sink-input removed, deferring deactivation: %s", self._active_sink)
+            self._cancel_deferred_deactivation()
+            self._deactivation_task = asyncio.create_task(
+                self._deferred_deactivate(self._active_sink)
+            )
+
+    async def _deferred_deactivate(self, sink_name: str, delay_s: int = 5) -> None:
+        """Wait briefly before deactivating to handle song transitions."""
+        try:
+            await asyncio.sleep(delay_s)
+        except asyncio.CancelledError:
+            return
+        if not self._active_sink_inputs and self._active_sink == sink_name:
+            logger.info("Sink deactivated (after grace period): %s", sink_name)
+            await self._on_deactivate(sink_name)
             self._active_sink = None
+        self._deactivation_task = None
 
     def clear_active(self) -> None:
         """Reset active state so the monitor can re-detect existing sink-inputs."""
+        self._cancel_deferred_deactivation()
         self._active_sink = None
         self._active_sink_inputs.clear()
 
