@@ -37,13 +37,13 @@ class SinkController:
     _sink_module_id: int
     _volume_listener: asyncio.Task[None]
 
-    def __init__(self, chromecast: Chromecast, cast_name: str) -> None:
+    def __init__(self, chromecast: Chromecast) -> None:
         self._cast = chromecast
-        self._sink_name = _make_sink_name(cast_name)
-        self._sink_friendly_name = _make_friendly_sink_name(cast_name)
+        self._sink_name = _make_sink_name(chromecast.name)
+        self._sink_friendly_name = _make_friendly_sink_name(chromecast.name)
         self._sink_module_id = -1
         self.available = True
-        logger.info("New device registered: cc %s -> sink %s", cast_name, self._sink_name)
+        logger.info(f"New cc device at {chromecast.cast_info.host}:{chromecast.cast_info.port} registered: {chromecast.name} -> sink {self._sink_name}")
 
     async def init(self) -> None:
         self._pulse = pulsectl_asyncio.PulseAsync(f"p-cast-{self._sink_name}")

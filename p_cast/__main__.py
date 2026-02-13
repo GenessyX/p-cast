@@ -33,6 +33,7 @@ def main() -> None:
         choices=["DEBUG", "INFO", "WARNING", "ERROR"],
         help="logging level (default: INFO)",
     )
+    parser.add_argument("--log-file", default="console", help="write logs to this filename instead of to the console")
     args = parser.parse_args()
 
     if not bitrate_ok(args.bitrate):
@@ -43,6 +44,8 @@ def main() -> None:
     os.environ["PCAST_PORT"] = str(args.port)
     os.environ["PCAST_FFMPEG"] = args.ffmpeg
     os.environ["PCAST_LOG_LEVEL"] = args.log_level
+    if args.log_file != 'console':
+        os.environ["PCAST_LOG_FILE"] = args.log_file
 
     server = Server(
         target="p_cast.app:create_app",

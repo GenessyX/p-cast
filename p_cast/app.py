@@ -303,10 +303,10 @@ async def lifespan(
                 logger.info("Device reappeared: %s", sink_name)
                 return
 
-        cast = discovery.create_chromecast(device_id)
-        if cast is None:
+        chromecast = discovery.create_chromecast(device_id)
+        if chromecast is None:
             return
-        controller = SinkController(chromecast=cast, cast_name=cast.name)
+        controller = SinkController(chromecast=chromecast)
         await controller.init()
         controllers[controller._sink_name] = controller
         await monitor.refresh_sink_indices()
@@ -383,7 +383,10 @@ def create_app() -> Starlette:
     assert all(v in os.environ for v in ("PCAST_LOG_LEVEL", "PCAST_PORT", "PCAST_BITRATE", "PCAST_FFMPEG"))
 
     log_level = getattr(logging, os.environ["PCAST_LOG_LEVEL"], logging.INFO)
-    logging.basicConfig(level=log_level, format="%(asctime)s %(levelname)s:%(name)s:%(message)s")
+    if "PCAST_LOG_FILE" in os.environ:
+        logging.basicConfig(filename = os.environ["PCAST_LOG_FILE"], level=log_level, format="%(asctime)s %(levelname)s:%(name)s:%(message)s")
+    else:
+        logging.basicConfig(level=log_level, format="%(asctime)s %(levelname)s:%(name)s:%(message)s")
 
     discovery = CastDiscovery()
     chromecasts = discovery.discover()
@@ -396,10 +399,9 @@ def create_app() -> Starlette:
     )
 
     controllers: dict[str, SinkController] = {}
-    for cast in chromecasts:
+    for chromecast in chromecasts:
         controller = SinkController(
-            chromecast=cast,
-            cast_name=cast.name,
+            chromecast=chromecast,
         )
         controllers[controller._sink_name] = controller
 
