@@ -97,19 +97,29 @@ class SinkController:
         sink = await self.get_sink()
         return sink.name  # pyright: ignore[reportAttributeAccessIssue]
 
-    async def close(self) -> None:
+    async def remove_sink(self) -> None:
+        """Unload the PA sink module and close the pulse connection.
+
+        The controller stays in the controllers dict so it can be restored
+        via init() when the device becomes reachable again.
+        """
         if hasattr(self, "_volume_listener"):
             self._volume_listener.cancel()
-        try:
-            await self._pulse.module_unload(self._sink_module_id)
-        except Exception:
-            logger.warning(
-                "Failed to unload PA module %d for sink %s",
-                self._sink_module_id,
-                self._sink_name,
-                exc_info=True,
-            )
+        if self._sink_module_id != -1:
+            try:
+                await self._pulse.module_unload(self._sink_module_id)
+            except Exception:
+                logger.warning(
+                    "Failed to unload PA module %d for sink %s",
+                    self._sink_module_id,
+                    self._sink_name,
+                    exc_info=True,
+                )
+            self._sink_module_id = -1
         self._pulse.close()
+
+    async def close(self) -> None:
+        await self.remove_sink()
 
     def get_volume(self, sink: pulsectl.PulseSinkInfo) -> float:
         return typing.cast("int", sink.volume.values[0])

@@ -34,6 +34,19 @@ from p_cast.ffmpeg import create_ffmpeg_stream_command
 logger = logging.getLogger(__name__)
 
 
+async def _tcp_probe(host: str, port: int, timeout: float = 3.0) -> bool:
+    """Check if a host is accepting TCP connections. No application-level traffic."""
+    try:
+        _, writer = await asyncio.wait_for(
+            asyncio.open_connection(host, port), timeout=timeout
+        )
+        writer.close()
+        await writer.wait_closed()
+    except (OSError, TimeoutError):
+        return False
+    return True
+
+
 class StaticFilesWithCORS(BaseHTTPMiddleware):
     """Wraps StaticFiles to add CORS headers and disable caching on HLS segment responses."""
     @override
@@ -96,6 +109,9 @@ class CastConnectionListener(ConnectionStatusListener):
                 self._on_disconnect(self._sink_name),
                 self._loop,
             )
+
+
+CAST_CONNECT_TIMEOUT = 10  # seconds to wait for Chromecast connection before giving up
 
 
 class ActiveStream:
@@ -168,7 +184,20 @@ async def lifespan(
             return
 
         cast = controller._cast
-        await asyncio.to_thread(cast.wait)
+        await asyncio.to_thread(cast.wait, timeout=CAST_CONNECT_TIMEOUT)
+
+        if cast.status is None:
+            logger.warning(
+                "Chromecast not reachable within %ds upon activation, removing sink: %s",
+                CAST_CONNECT_TIMEOUT,
+                sink_name,
+            )
+            controller.available = False
+            cast.disconnect()
+            await controller.remove_sink()
+            await monitor.refresh_sink_indices()
+            monitor.clear_active()
+            return
 
         stream_dir = tempfile.TemporaryDirectory()  # noqa: SIM115
         ffmpeg_process: asyncio.subprocess.Process | None = None
@@ -299,8 +328,24 @@ async def lifespan(
         # Check if controller already exists (device reappearing)
         for sink_name, controller in controllers.items():
             if controller._cast.uuid == device_id:
+                if controller.available:
+                    return
+                # Was unavailable (connection timed out) — TCP probe before restoring
+                address = discovery.get_device_address(device_id)
+                if address is None:
+                    return
+                if not await _tcp_probe(*address):
+                    logger.debug("TCP probe failed for %s at %s:%d", sink_name, *address)
+                    return
+                # Device is reachable again — fresh Chromecast + restore PA sink
+                chromecast = discovery.create_chromecast(device_id)
+                if chromecast is None:
+                    return
+                controller._cast = chromecast
                 controller.available = True
-                logger.info("Device reappeared: %s", sink_name)
+                await controller.init()
+                await monitor.refresh_sink_indices()
+                logger.info("Device restored: %s", sink_name)
                 return
 
         chromecast = discovery.create_chromecast(device_id)

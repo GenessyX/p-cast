@@ -85,6 +85,15 @@ class CastDiscovery:
         self._on_add = on_add
         self._on_remove = on_remove
 
+    def get_device_address(self, device_id: UUID) -> tuple[str, int] | None:
+        """Return (host, port) for a discovered device, or None if unknown."""
+        if self._browser is None:
+            return None
+        cast_info = self._browser.devices.get(device_id)
+        if cast_info is None or cast_info.host is None or cast_info.port is None:
+            return None
+        return (cast_info.host, cast_info.port)
+
     def create_chromecast(self, device_id: UUID) -> pychromecast.Chromecast | None:
         """Create a Chromecast object for a dynamically discovered device."""
         if self._browser is None:
