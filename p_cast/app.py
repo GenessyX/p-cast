@@ -172,7 +172,12 @@ async def lifespan(
         if active_stream is None:
             return
         logger.warning("Chromecast disconnected, tearing down: %s", sink_name)
+        controller = controllers[sink_name]
         await on_deactivate(sink_name)
+        controller.available = False
+        controller._cast.disconnect()
+        await controller.remove_sink()
+        await monitor.refresh_sink_indices()
         monitor.clear_active()
 
     async def on_activate(sink_name: str) -> None:
@@ -432,6 +437,8 @@ def create_app() -> Starlette:
         logging.basicConfig(filename = os.environ["PCAST_LOG_FILE"], level=log_level, format="%(asctime)s %(levelname)s:%(name)s:%(message)s")
     else:
         logging.basicConfig(level=log_level, format="%(asctime)s %(levelname)s:%(name)s:%(message)s")
+
+    logging.info("*** p-cast instance starting ***")
 
     discovery = CastDiscovery()
     chromecasts = discovery.discover()
