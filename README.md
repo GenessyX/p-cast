@@ -141,6 +141,14 @@ This delay is primarily due to how Chromecast handles **HLS streaming**, which i
 * Enhance repository structure.
 * Qt tray app to control chromecast device (pause/play).
 
+## Contributing
+
+1. Install pre-commit hooks:
+
+```bash
+uv run pre-commit install
+```
+
 ## License
 
 [GPL-3.0](LICENSE)

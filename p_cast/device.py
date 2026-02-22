@@ -51,7 +51,7 @@ class SinkController:
 
     async def get_sink_name(self) -> str:
         sink = await self.get_sink()
-        return sink.name  # pyright: ignore[reportAttributeAccessIssue]
+        return sink.name  # type: ignore[no-any-return]
 
     async def close(self) -> None:
         await self._pulse.module_unload(self._sink_module_id)
