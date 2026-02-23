@@ -9,6 +9,7 @@ from functools import partial
 from typing import override
 from uuid import UUID
 
+from pychromecast.controllers.media import MediaStatus, MediaStatusListener
 from pychromecast.error import RequestTimeout
 from pychromecast.socket_client import (
     CONNECTION_STATUS_DISCONNECTED,
@@ -35,6 +36,7 @@ logger = logging.getLogger(__name__)
 
 _FFMPEG_STARTUP_DELAY = 0.5
 _STREAM_SUBSCRIBE_DELAY = 2
+_BUFFERING_RECOVER_TIMEOUT = 6  # seconds of sustained BUFFERING before restarting stream (6 is minimum)
 
 
 async def _tcp_probe(host: str, port: int, probe_timeout: float = 3.0) -> bool:
@@ -119,6 +121,76 @@ class CastConnectionListener(ConnectionStatusListener):
 CAST_CONNECT_TIMEOUT = 10  # seconds to wait for Chromecast connection before giving up
 
 
+class BufferingWatchdog(MediaStatusListener):
+    """Detects sustained BUFFERING and triggers a stream restart.
+
+    new_media_status() is called from pychromecast's socket thread; all asyncio
+    interactions are scheduled via call_soon_threadsafe onto the event loop.
+    """
+
+    def __init__(
+        self,
+        loop: asyncio.AbstractEventLoop,
+        sink_name: str,
+        on_recover: Callable[[str], Coroutine[None, None, None]],
+    ) -> None:
+        self._loop = loop
+        self._sink_name = sink_name
+        self._on_recover = on_recover
+        self._active = True
+        self._timer_task: asyncio.Task[None] | None = None
+
+    @override
+    def new_media_status(self, status: MediaStatus) -> None:
+        if not self._active:
+            return
+        if status.player_state == "BUFFERING":
+            self._loop.call_soon_threadsafe(self._start_timer)
+        else:
+            self._loop.call_soon_threadsafe(self._cancel_timer)
+
+    @override
+    def load_media_failed(self, queue_item_id: int, error_code: int) -> None:
+        logger.warning(
+            "Media load failed for %s (queue_item=%d, error=%d)",
+            self._sink_name,
+            queue_item_id,
+            error_code,
+        )
+
+    def _start_timer(self) -> None:
+        """Schedule recovery if not already pending. Called on event loop."""
+        if self._timer_task is None or self._timer_task.done():
+            self._timer_task = asyncio.create_task(self._recover_after_timeout())
+
+    def _cancel_timer(self) -> None:
+        """Cancel a pending recovery timer. Called on event loop."""
+        if self._timer_task is not None:
+            self._timer_task.cancel()
+            self._timer_task = None
+
+    async def _recover_after_timeout(self) -> None:
+        try:
+            await asyncio.sleep(_BUFFERING_RECOVER_TIMEOUT)
+        except asyncio.CancelledError:
+            return
+        # Clear before recovery so a concurrent cancel() won't re-cancel a running task
+        self._timer_task = None
+        if not self._active:
+            return
+        logger.warning(
+            "Buffering watchdog: %ds without recovery for %s, restarting stream",
+            _BUFFERING_RECOVER_TIMEOUT,
+            self._sink_name,
+        )
+        await self._on_recover(self._sink_name)
+
+    def cancel(self) -> None:
+        """Permanently disable watchdog. Called on event loop during stream teardown."""
+        self._active = False
+        self._cancel_timer()
+
+
 class ActiveStream:
     """Holds all resources for a running stream (FFmpeg process, temp dir, Starlette mount).
 
@@ -134,6 +206,7 @@ class ActiveStream:
         volume_controller: SinkController,
         ffmpeg_watcher: asyncio.Task[None],
         connection_listener: CastConnectionListener,
+        buffering_watchdog: BufferingWatchdog,
     ) -> None:
         self.ffmpeg_process = ffmpeg_process
         self.stream_dir = stream_dir
@@ -142,9 +215,11 @@ class ActiveStream:
         self.volume_controller = volume_controller
         self.ffmpeg_watcher = ffmpeg_watcher
         self.connection_listener = connection_listener
+        self.buffering_watchdog = buffering_watchdog
 
     async def teardown(self) -> None:
         self.connection_listener.deactivate()
+        self.buffering_watchdog.cancel()
         self.subscribe_task.cancel()
         self.ffmpeg_watcher.cancel()
         if self.ffmpeg_process.returncode is None:
@@ -308,6 +383,13 @@ async def lifespan(  # noqa: C901, PLR0915
             )
             cast.register_connection_listener(connection_listener)
 
+            buffering_watchdog = BufferingWatchdog(
+                loop=loop,
+                sink_name=sink_name,
+                on_recover=restart_stream,
+            )
+            cast.media_controller.register_status_listener(buffering_watchdog)
+
             active_stream = ActiveStream(
                 ffmpeg_process=ffmpeg_process,
                 stream_dir=stream_dir,
@@ -316,6 +398,7 @@ async def lifespan(  # noqa: C901, PLR0915
                 volume_controller=controller,
                 ffmpeg_watcher=ffmpeg_watcher,
                 connection_listener=connection_listener,
+                buffering_watchdog=buffering_watchdog,
             )
 
             app.state.active_controller = controller
@@ -341,6 +424,10 @@ async def lifespan(  # noqa: C901, PLR0915
             active_stream = None
             app.state.active_controller = None
             controllers[sink_name].cast.disconnect()
+
+    async def restart_stream(sink_name: str) -> None:
+        await on_deactivate(sink_name)
+        await on_activate(sink_name)
 
     monitor = SinkInputMonitor(
         controllers=controllers,
