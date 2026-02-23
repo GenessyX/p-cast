@@ -19,6 +19,7 @@ from starlette.responses import JSONResponse, Response
 from starlette.routing import Route
 from starlette.staticfiles import StaticFiles
 
+from pychromecast.error import RequestTimeout
 from pychromecast.socket_client import (
     ConnectionStatus,
     ConnectionStatusListener,
@@ -64,14 +65,14 @@ class StaticFilesWithCORS(BaseHTTPMiddleware):
         raw_length = response.headers.get("content-length")
         content_length = int(raw_length) / 1024 if raw_length else 0
 
-        logger.debug(
-            "[%s:%s] %s - %s - %s KiB",
-            client[0],
-            client[1],
-            method,
-            path,
-            content_length,
-        )
+        # logger.debug(
+        #     "[%s:%s] %s - %s - %s KiB",
+        #     client[0],
+        #     client[1],
+        #     method,
+        #     path,
+        #     content_length,
+        # )
         response.headers["Access-Control-Allow-Origin"] = "*"
         response.headers["Access-Control-Allow-Credentials"] = "true"
         response.headers["Cache-Control"] = "no-cache"
@@ -169,10 +170,12 @@ async def lifespan(
 
     async def handle_cast_disconnect(sink_name: str) -> None:
         nonlocal active_stream
-        if active_stream is None:
+        controller = controllers[sink_name]
+        # Make this idempotent: LOST can fire from the socket thread even while the
+        # event loop is already processing a deactivation / device-remove.
+        if not controller.available:
             return
         logger.warning("Chromecast disconnected, tearing down: %s", sink_name)
-        controller = controllers[sink_name]
         await on_deactivate(sink_name)
         controller.available = False
         controller._cast.disconnect()
@@ -188,8 +191,25 @@ async def lifespan(
             logger.warning("Skipping activation for unavailable device: %s", sink_name)
             return
 
-        cast = controller._cast
-        await asyncio.to_thread(cast.wait, timeout=CAST_CONNECT_TIMEOUT)
+        # Stop any leftover socket thread from the previous chromecast object.
+        # No-op on first activation (socket thread not started until wait()).
+        try:
+            controller._cast.disconnect()
+        except RuntimeError:
+            pass  # that should be fine
+        cast = discovery.create_chromecast(controller._cast.uuid)
+        if cast is None:
+            logger.warning("Device gone from zeroconf during activation: %s", sink_name)
+            controller.available = False
+            await controller.remove_sink()
+            await monitor.refresh_sink_indices()
+            monitor.clear_active()
+            return
+        controller._cast = cast
+        try:
+            await asyncio.to_thread(cast.wait, timeout=CAST_CONNECT_TIMEOUT)
+        except RequestTimeout:
+            pass  # cast.status will be None
 
         if cast.status is None:
             logger.warning(
@@ -245,6 +265,7 @@ async def lifespan(
                 stream_dir.cleanup()
                 return
 
+            logger.debug("Publishing audio stream for chromecast")
             stream_app = StaticFilesWithCORS(StaticFiles(directory=stream_dir.name))
             app.mount("/stream", stream_app)
 
@@ -321,6 +342,7 @@ async def lifespan(
             ]
             active_stream = None
             app.state.active_controller = None
+            controllers[sink_name]._cast.disconnect()
 
     monitor = SinkInputMonitor(
         controllers=controllers,
@@ -342,9 +364,18 @@ async def lifespan(
                 if not await _tcp_probe(*address):
                     logger.debug("TCP probe failed for %s at %s:%d", sink_name, *address)
                     return
-                # Device is reachable again — fresh Chromecast + restore PA sink
+                # Device is reachable again — verify at the application level
+                # (failing devices can connect with TCP but fail at TLS/chromecast level)
                 chromecast = discovery.create_chromecast(device_id)
                 if chromecast is None:
+                    return
+                try:
+                    await asyncio.to_thread(chromecast.wait, timeout=CAST_CONNECT_TIMEOUT)
+                except RequestTimeout:
+                    pass
+                chromecast.disconnect()
+                if chromecast.status is None:
+                    logger.debug("Device %s passed TCP probe but not reachable at app level, ignoring", sink_name)
                     return
                 controller._cast = chromecast
                 controller.available = True
@@ -364,7 +395,18 @@ async def lifespan(
     async def handle_device_remove(device_id: UUID) -> None:
         for sink_name, controller in controllers.items():
             if controller._cast.uuid == device_id:
+                if not controller.available:
+                    return
+                if active_stream is not None and monitor.active_sink == sink_name:
+                    await on_deactivate(sink_name)
+                    monitor.clear_active()
                 controller.available = False
+                try:
+                    controller._cast.disconnect()
+                except RuntimeError:
+                    pass  # socket thread was never started (device was idle)
+                await controller.remove_sink()
+                await monitor.refresh_sink_indices()
                 logger.info("Device unavailable: %s", sink_name)
                 return
 

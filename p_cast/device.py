@@ -97,11 +97,13 @@ class SinkController:
         sink = await self.get_sink()
         return sink.name  # pyright: ignore[reportAttributeAccessIssue]
 
-    async def remove_sink(self) -> None:
+    async def remove_sink(self, stale_ok=False) -> None:
         """Unload the PA sink module and close the pulse connection.
 
         The controller stays in the controllers dict so it can be restored
         via init() when the device becomes reachable again.
+
+        In case we're shutting down, a stale pulse connection is untroubling; set to True.
         """
         if hasattr(self, "_volume_listener"):
             self._volume_listener.cancel()
@@ -109,17 +111,19 @@ class SinkController:
             try:
                 await self._pulse.module_unload(self._sink_module_id)
             except Exception:
-                logger.warning(
+                logger.log(
+                    logging.INFO if stale_ok else logging.WARNING,
                     "Failed to unload PA module %d for sink %s",
                     self._sink_module_id,
                     self._sink_name,
-                    exc_info=True,
+                    exc_info=(not stale_ok),
                 )
             self._sink_module_id = -1
         self._pulse.close()
 
     async def close(self) -> None:
-        await self.remove_sink()
+        """Shutdown cleanup — best-effort, pulse connection may be stale."""
+        await self.remove_sink(True)
 
     def get_volume(self, sink: pulsectl.PulseSinkInfo) -> float:
         return typing.cast("int", sink.volume.values[0])
@@ -219,7 +223,7 @@ class SinkInputMonitor:
         self._cancel_deferred_deactivation()
         if hasattr(self, "_task"):
             self._task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
+            with contextlib.suppress(asyncio.CancelledError, Exception):
                 await self._task
         if hasattr(self, "_pulse"):
             self._pulse.close()
@@ -230,6 +234,8 @@ class SinkInputMonitor:
         """Re-query all controllers to rebuild the sink index mapping."""
         mapping: dict[int, str] = {}
         for sink_name, controller in self._controllers.items():
+            if not controller.available:
+                continue
             try:
                 sink = await controller.get_sink()
                 mapping[sink.index] = sink_name  # pyright: ignore[reportAttributeAccessIssue]
@@ -330,7 +336,7 @@ class SinkInputMonitor:
                 self._deferred_deactivate(self._active_sink)
             )
 
-    async def _deferred_deactivate(self, sink_name: str, delay_s: int = 5) -> None:
+    async def _deferred_deactivate(self, sink_name: str, delay_s: int = 15) -> None:
         """Wait briefly before deactivating to handle song transitions."""
         try:
             await asyncio.sleep(delay_s)
