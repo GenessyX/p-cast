@@ -363,63 +363,61 @@ async def lifespan(  # noqa: C901, PLR0915
         await monitor.refresh_sink_indices()
         logger.info("Device unavailable: %s", sink_name)
 
-    async def handle_device_add(device_id: UUID) -> None:  # noqa: C901
-        for sink_name, controller in controllers.items():
+    def get_controller(device_id: UUID) -> SinkController | None:
+        for controller in controllers.values():
             if controller.cast.uuid == device_id:
-                if not controller.available:
-                    # Cheap pre-filter: skip expensive wait() if TCP is dead
-                    address = discovery.get_device_address(device_id)
-                    if address is None:
-                        return
-                    if not await _tcp_probe(*address):
-                        logger.debug("TCP probe failed for %s at %s:%d", sink_name, *address)
-                        return
+                return controller
+        return None
 
-                # Full app-level health check via chromecast.wait().
-                #
-                # pychromecast's HostBrowser polls devices every 30s via HTTP.
-                # After 5 consecutive failures (~150s) it fires remove_service,
-                # but if the device still responds to mDNS (network stack up,
-                # chromecast app hung) zeroconf re-adds it within seconds —
-                # suppressing our remove_cast callback entirely. A device can
-                # stay in this state for hours (until device mDNS truly fails).
-                # (see pychromecast #1168)
-                #
-                # For available devices, this check catches that case. For
-                # normally-functioning chromecasts this only runs on zeroconf
-                # TTL cycles (~75 min) and completes quickly (1-3s).
-                # For unavailable devices, this verifies genuine availability.
-                #
-                # The wait() is offloaded to a thread so it doesn't block the
-                # event loop (playback, monitoring, HTTP all continue).
-                chromecast = discovery.create_chromecast(device_id)
-                if chromecast is None:
-                    return
-                with contextlib.suppress(RequestTimeout):
-                    await asyncio.to_thread(chromecast.wait, timeout=CAST_CONNECT_TIMEOUT)
-                chromecast.disconnect()
-
-                if chromecast.status is None:
-                    if controller.available:
-                        logger.warning("Device %s failed health check on re-add", sink_name)
-                        await mark_device_unavailable(sink_name, controller)
-                    else:
-                        logger.debug("Device %s not yet reachable at app level", sink_name)
-                    return
-
-                if not controller.available:
-                    controller.available = True
-                    await controller.init()
-                    await monitor.refresh_sink_indices()
-                    logger.info("Device restored: %s", sink_name)
+    async def handle_device_add(device_id: UUID) -> None:
+        controller = get_controller(device_id)
+        if controller and not controller.available:
+            # Cheap pre-filter: skip expensive wait() if TCP is dead
+            address = discovery.get_device_address(device_id)
+            if address is None:
+                return
+            if not await _tcp_probe(*address):
+                logger.debug("TCP probe failed for %s at %s:%d", controller.sink_name, *address)
                 return
 
+        # Before (re-)adding, ensure we can actually connect at the application level
+
+        # NOTE: pychromecast's HostBrowser polls devices every 30s via HTTP.
+        # After 5 consecutive failures (~150s) it fires remove_service,
+        # but if the device still responds to mDNS (network stack up,
+        # chromecast app hung) zeroconf re-adds it within seconds —
+        # suppressing our remove_cast callback entirely. A device can
+        # stay in this state for hours (until device mDNS truly fails).
+        # (see pychromecast #1168)
+        #
+        # For available devices, this check catches that case. For
+        # normally-functioning chromecasts this only runs on zeroconf
+        # TTL cycles (~75 min) and completes quickly (1-3s).
+        # For unavailable devices, this verifies genuine availability.
         chromecast = discovery.create_chromecast(device_id)
         if chromecast is None:
             return
-        controller = SinkController(chromecast=chromecast)
-        await controller.init()
-        controllers[controller.sink_name] = controller
+        with contextlib.suppress(RequestTimeout):
+            await asyncio.to_thread(chromecast.wait, timeout=CAST_CONNECT_TIMEOUT)
+        chromecast.disconnect()
+
+        if chromecast.status is None:
+            if controller and controller.available:
+                logger.warning("Device %s failed health check on add", controller.sink_name)
+                await mark_device_unavailable(controller.sink_name, controller)
+            else:
+                logger.debug("Device %s not yet reachable at app level", device_id)
+            return
+
+        if not controller:
+            controller = SinkController(chromecast=chromecast)
+            await controller.init()
+            controllers[controller.sink_name] = controller
+            logger.info("Device added: %s", controller.sink_name)
+        elif not controller.available:
+            controller.available = True
+            await controller.init()
+            logger.info("Device restored: %s", controller.sink_name)
         await monitor.refresh_sink_indices()
 
     async def handle_device_remove(device_id: UUID) -> None:
