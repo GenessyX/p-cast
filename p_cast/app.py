@@ -351,21 +351,51 @@ async def lifespan(
     )
     await monitor.start()
 
+    async def mark_device_unavailable(sink_name: str, controller: SinkController) -> None:
+        """Shared cleanup for device removal and health-check failure."""
+        if not controller.available:
+            return
+        if active_stream is not None and monitor.active_sink == sink_name:
+            await on_deactivate(sink_name)
+            monitor.clear_active()
+        controller.available = False
+        try:
+            controller._cast.disconnect()
+        except RuntimeError:
+            pass  # socket thread was never started (device was idle)
+        await controller.remove_sink()
+        await monitor.refresh_sink_indices()
+        logger.info("Device unavailable: %s", sink_name)
+
     async def handle_device_add(device_id: UUID) -> None:
-        # Check if controller already exists (device reappearing)
         for sink_name, controller in controllers.items():
             if controller._cast.uuid == device_id:
-                if controller.available:
-                    return
-                # Was unavailable (connection timed out) — TCP probe before restoring
-                address = discovery.get_device_address(device_id)
-                if address is None:
-                    return
-                if not await _tcp_probe(*address):
-                    logger.debug("TCP probe failed for %s at %s:%d", sink_name, *address)
-                    return
-                # Device is reachable again — verify at the application level
-                # (failing devices can connect with TCP but fail at TLS/chromecast level)
+                if not controller.available:
+                    # Cheap pre-filter: skip expensive wait() if TCP is dead
+                    address = discovery.get_device_address(device_id)
+                    if address is None:
+                        return
+                    if not await _tcp_probe(*address):
+                        logger.debug("TCP probe failed for %s at %s:%d", sink_name, *address)
+                        return
+
+                # Full app-level health check via chromecast.wait().
+                #
+                # pychromecast's HostBrowser polls devices every 30s via HTTP.
+                # After 5 consecutive failures (~150s) it fires remove_service,
+                # but if the device still responds to mDNS (network stack up,
+                # chromecast app hung) zeroconf re-adds it within seconds —
+                # suppressing our remove_cast callback entirely. A device can
+                # stay in this state for hours (until device mDNS truly fails).
+                # (see pychromecast #1168)
+                #
+                # For available devices, this check catches that case. For
+                # normally-functioning chromecasts this only runs on zeroconf
+                # TTL cycles (~75 min) and completes quickly (1-3s).
+                # For unavailable devices, this verifies genuine availability.
+                #
+                # The wait() is offloaded to a thread so it doesn't block the
+                # event loop (playback, monitoring, HTTP all continue).
                 chromecast = discovery.create_chromecast(device_id)
                 if chromecast is None:
                     return
@@ -374,14 +404,20 @@ async def lifespan(
                 except RequestTimeout:
                     pass
                 chromecast.disconnect()
+
                 if chromecast.status is None:
-                    logger.debug("Device %s passed TCP probe but not reachable at app level, ignoring", sink_name)
+                    if controller.available:
+                        logger.warning("Device %s failed health check on re-add", sink_name)
+                        await mark_device_unavailable(sink_name, controller)
+                    else:
+                        logger.debug("Device %s not yet reachable at app level", sink_name)
                     return
-                controller._cast = chromecast
-                controller.available = True
-                await controller.init()
-                await monitor.refresh_sink_indices()
-                logger.info("Device restored: %s", sink_name)
+
+                if not controller.available:
+                    controller.available = True
+                    await controller.init()
+                    await monitor.refresh_sink_indices()
+                    logger.info("Device restored: %s", sink_name)
                 return
 
         chromecast = discovery.create_chromecast(device_id)
@@ -395,19 +431,7 @@ async def lifespan(
     async def handle_device_remove(device_id: UUID) -> None:
         for sink_name, controller in controllers.items():
             if controller._cast.uuid == device_id:
-                if not controller.available:
-                    return
-                if active_stream is not None and monitor.active_sink == sink_name:
-                    await on_deactivate(sink_name)
-                    monitor.clear_active()
-                controller.available = False
-                try:
-                    controller._cast.disconnect()
-                except RuntimeError:
-                    pass  # socket thread was never started (device was idle)
-                await controller.remove_sink()
-                await monitor.refresh_sink_indices()
-                logger.info("Device unavailable: %s", sink_name)
+                await mark_device_unavailable(sink_name, controller)
                 return
 
     discovery.set_callbacks(
