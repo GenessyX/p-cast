@@ -2,6 +2,7 @@ import asyncio
 import contextlib
 import logging
 import os
+import signal
 import tempfile
 import typing
 from collections.abc import AsyncIterator, Callable, Coroutine
@@ -204,7 +205,6 @@ class ActiveStream:
         stream_app: StaticFilesWithCORS,
         subscribe_task: asyncio.Task[None],
         volume_controller: SinkController,
-        ffmpeg_watcher: asyncio.Task[None],
         connection_listener: CastConnectionListener,
         buffering_watchdog: BufferingWatchdog,
     ) -> None:
@@ -213,7 +213,6 @@ class ActiveStream:
         self.stream_app = stream_app
         self.subscribe_task = subscribe_task
         self.volume_controller = volume_controller
-        self.ffmpeg_watcher = ffmpeg_watcher
         self.connection_listener = connection_listener
         self.buffering_watchdog = buffering_watchdog
 
@@ -221,7 +220,6 @@ class ActiveStream:
         self.connection_listener.deactivate()
         self.buffering_watchdog.cancel()
         self.subscribe_task.cancel()
-        self.ffmpeg_watcher.cancel()
         if self.ffmpeg_process.returncode is None:
             self.ffmpeg_process.terminate()
             await self.ffmpeg_process.wait()
@@ -262,7 +260,7 @@ async def lifespan(  # noqa: C901, PLR0915
         await monitor.refresh_sink_indices()
         monitor.clear_active()
 
-    async def on_activate(sink_name: str) -> None:  # noqa: C901, PLR0915
+    async def on_activate(sink_name: str) -> None:  # noqa: PLR0915
         nonlocal active_stream
 
         controller = controllers[sink_name]
@@ -303,7 +301,6 @@ async def lifespan(  # noqa: C901, PLR0915
         stream_dir = tempfile.TemporaryDirectory()
         ffmpeg_process: asyncio.subprocess.Process | None = None
         subscribe_task: asyncio.Task[None] | None = None
-        ffmpeg_watcher: asyncio.Task[None] | None = None
 
         try:
             sink_info = await controller.get_sink()
@@ -328,16 +325,20 @@ async def lifespan(  # noqa: C901, PLR0915
                 stderr=asyncio.subprocess.PIPE,
             )
 
-            # Give FFmpeg a moment to fail on startup errors (missing libs, bad args)
+            # Give FFmpeg a moment to fail on startup errors (missing libs, bad args).
+            # An immediate exit is a programming or configuration error — shut down.
             await asyncio.sleep(_FFMPEG_STARTUP_DELAY)
             if ffmpeg_process.returncode is not None:
                 stderr = await ffmpeg_process.stderr.read() if ffmpeg_process.stderr else b""
                 logger.error(
-                    "FFmpeg exited immediately (code %d): %s",
+                    "FFmpeg exited immediately (code %d): %s — shutting down",
                     ffmpeg_process.returncode,
                     stderr.decode(errors="replace").strip(),
                 )
+                cast.disconnect()
                 stream_dir.cleanup()
+                # trigger graceful uvicorn shutdown handler
+                os.kill(os.getpid(), signal.SIGTERM)
                 return
 
             logger.debug("Publishing audio stream for chromecast")
@@ -352,27 +353,6 @@ async def lifespan(  # noqa: C901, PLR0915
                     logger.exception("Failed to subscribe Chromecast to stream")
 
             subscribe_task = asyncio.create_task(subscribe())
-
-            async def watch_ffmpeg() -> None:
-                # assert ffmpeg_process is not None  # would indicate internal error
-                await ffmpeg_process.wait()
-                if active_stream is not None and active_stream.ffmpeg_process is ffmpeg_process:
-                    stderr_data = b""
-                    if ffmpeg_process.stderr:
-                        stderr_data = await ffmpeg_process.stderr.read()
-                    logger.error(
-                        "FFmpeg exited unexpectedly (code %d): %s",
-                        ffmpeg_process.returncode,
-                        stderr_data.decode(errors="replace").strip(),
-                    )
-                    # in this case, audio is still routed to the sink but not sent to chromecast.
-                    # The user will notice silence and can switch from/back to the sink to retry.
-                    await on_deactivate(sink_name)
-                    # Reset monitor state so re-detection can also happen on the
-                    # next PulseAudio event (e.g. new sink-input or volume change)
-                    monitor.clear_active()
-
-            ffmpeg_watcher = asyncio.create_task(watch_ffmpeg())
 
             await controller.start_volume_sync()
 
@@ -396,7 +376,6 @@ async def lifespan(  # noqa: C901, PLR0915
                 stream_app=stream_app,
                 subscribe_task=subscribe_task,
                 volume_controller=controller,
-                ffmpeg_watcher=ffmpeg_watcher,
                 connection_listener=connection_listener,
                 buffering_watchdog=buffering_watchdog,
             )
@@ -407,8 +386,6 @@ async def lifespan(  # noqa: C901, PLR0915
             logger.exception("Failed to activate stream for sink: %s", sink_name)
             if subscribe_task is not None:
                 subscribe_task.cancel()
-            if ffmpeg_watcher is not None:
-                ffmpeg_watcher.cancel()
             if ffmpeg_process is not None and ffmpeg_process.returncode is None:
                 ffmpeg_process.terminate()
                 await ffmpeg_process.wait()
