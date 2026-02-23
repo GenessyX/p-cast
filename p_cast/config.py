@@ -10,8 +10,10 @@ MAX_SAMPLE_RATE = 96000
 @dataclass
 class StreamConfig:
     """Audio encoding and HLS output parameters for the FFmpeg streaming pipeline."""
+
     # aac (-lc) is the only supported codec, and there is none better.
-    # Chromecast won't support FLAC w/ HLS. MP3 is inferior quality per bitrate and not significantly less resource intensive to encode
+    # Chromecast won't support FLAC w/ HLS. MP3 is inferior quality per bitrate and
+    # not significantly less resource intensive to encode
     acodec: AudioCodec = "aac"
     bitrate: str = "192k"
     hls_segment_type: HlsSegmentType = "mpegts"

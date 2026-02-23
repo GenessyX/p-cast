@@ -19,9 +19,13 @@ type DeactivationCallback = Callable[[str], Coroutine[None, None, None]]
 
 _SINK_NAME_INVALID_CHARS = re.compile(r"[^a-zA-Z0-9_-]")
 
+_MIN_AUDIBLE_VOLUME = 0.1
+
+
 def _make_sink_name(chromecast_name: str) -> str:
     sanitized = _SINK_NAME_INVALID_CHARS.sub("_", chromecast_name).lower()
     return f"{sanitized}_cast"
+
 
 def _make_friendly_sink_name(chromecast_name: str) -> str:
     return f"{chromecast_name} Cast"
@@ -38,17 +42,23 @@ class SinkController:
     _volume_listener: asyncio.Task[None]
 
     def __init__(self, chromecast: Chromecast) -> None:
-        self._cast = chromecast
-        self._sink_name = _make_sink_name(chromecast.name)
-        self._sink_friendly_name = _make_friendly_sink_name(chromecast.name)
+        self.cast = chromecast
+        self.sink_name = _make_sink_name(chromecast.name)  # type: ignore[arg-type]
+        self._sink_friendly_name = _make_friendly_sink_name(chromecast.name)  # type: ignore[arg-type]
         self._sink_module_id = -1
         self.available = True
-        logger.info(f"New cc device at {chromecast.cast_info.host}:{chromecast.cast_info.port} registered: {chromecast.name} -> sink {self._sink_name}")
+        logger.info(
+            "New cc device at %s:%s registered: %s -> sink %s",
+            chromecast.cast_info.host,
+            chromecast.cast_info.port,
+            chromecast.name,
+            self.sink_name,
+        )
 
     async def init(self) -> None:
-        self._pulse = pulsectl_asyncio.PulseAsync(f"p-cast-{self._sink_name}")
+        self._pulse = pulsectl_asyncio.PulseAsync(f"p-cast-{self.sink_name}")
         await self._pulse.connect()
-        self._sink_module_id = await self.create_sink(self._sink_name, self._sink_friendly_name)
+        self._sink_module_id = await self.create_sink(self.sink_name, self._sink_friendly_name)
 
     async def start_volume_sync(self) -> None:
         self._volume_listener = asyncio.create_task(self._subscribe_volume())
@@ -90,14 +100,14 @@ class SinkController:
             raise SinkError(msg)
         return typing.cast(
             "pulsectl.PulseSinkInfo",
-            await self._pulse.get_sink_by_name(self._sink_name),
+            await self._pulse.get_sink_by_name(self.sink_name),
         )
 
     async def get_sink_name(self) -> str:
         sink = await self.get_sink()
-        return sink.name  # pyright: ignore[reportAttributeAccessIssue]
+        return sink.name  # type: ignore[no-any-return]
 
-    async def remove_sink(self, stale_ok=False) -> None:
+    async def remove_sink(self, *, stale_ok: bool = False) -> None:
         """Unload the PA sink module and close the pulse connection.
 
         The controller stays in the controllers dict so it can be restored
@@ -115,7 +125,7 @@ class SinkController:
                     logging.INFO if stale_ok else logging.WARNING,
                     "Failed to unload PA module %d for sink %s",
                     self._sink_module_id,
-                    self._sink_name,
+                    self.sink_name,
                     exc_info=(not stale_ok),
                 )
             self._sink_module_id = -1
@@ -123,7 +133,7 @@ class SinkController:
 
     async def close(self) -> None:
         """Shutdown cleanup — best-effort, pulse connection may be stale."""
-        await self.remove_sink(True)
+        await self.remove_sink(stale_ok=True)
 
     def get_volume(self, sink: pulsectl.PulseSinkInfo) -> float:
         return typing.cast("int", sink.volume.values[0])
@@ -131,21 +141,21 @@ class SinkController:
     def get_mute(self, sink: pulsectl.PulseSinkInfo) -> bool:
         return bool(sink.mute)  # pyright: ignore[reportAttributeAccessIssue]
 
-    async def _subscribe_volume(self) -> None:
+    async def _subscribe_volume(self) -> None:  # noqa: C901
         sink = await self.get_sink()
 
         # Initialize sink volume from Chromecast's current state, ensuring it is at least audible
         try:
-            cast_volume = self._cast.status.volume_level
-            cast_mute = self._cast.status.volume_muted
+            cast_volume = self.cast.status.volume_level  # type: ignore[union-attr]
+            cast_mute = self.cast.status.volume_muted  # type: ignore[union-attr]
             if cast_mute:
-                self._cast.set_volume_muted(False)
-            if cast_volume is not None and cast_volume < 0.1:
-                self._cast.set_volume(0.1)
-                cast_volume = 0.1
+                self.cast.set_volume_muted(muted=False)
+            if cast_volume is not None and cast_volume < _MIN_AUDIBLE_VOLUME:
+                self.cast.set_volume(_MIN_AUDIBLE_VOLUME)
+                cast_volume = _MIN_AUDIBLE_VOLUME
             if cast_volume is not None:
                 await self._pulse.volume_set_all_chans(sink, cast_volume)
-            await self._pulse.mute(sink, False)
+            await self._pulse.mute(sink, mute=False)
             sink = await self.get_sink()
         except Exception:
             logger.warning("Failed to initialize sink volume from Chromecast", exc_info=True)
@@ -166,10 +176,10 @@ class SinkController:
             changed_mute = self.get_mute(changed_sink)
             try:
                 if changed_volume != current_volume:
-                    self._cast.set_volume(volume=changed_volume)
+                    self.cast.set_volume(volume=changed_volume)
                     current_volume = changed_volume
                 if changed_mute != current_mute:
-                    self._cast.set_volume_muted(muted=changed_mute)
+                    self.cast.set_volume_muted(muted=changed_mute)
                     current_mute = changed_mute
             except Exception:
                 logger.warning("Failed to sync volume to Chromecast", exc_info=True)
@@ -266,7 +276,7 @@ class SinkInputMonitor:
         await self.refresh_sink_indices()
         logger.info(
             "Sink-input monitor started, watching sink indices: %s",
-            {idx: name for idx, name in self._sink_indices.items()},
+            dict(self._sink_indices.items()),
         )
 
         await self._check_existing_sink_inputs()
@@ -276,11 +286,7 @@ class SinkInputMonitor:
         ):
             logger.debug("sink_input event: %s", event)
 
-            if event.t == pulsectl.PulseEventTypeEnum.new:  # pyright: ignore[reportAttributeAccessIssue]
-                await self._handle_sink_input_update(
-                    event.index,  # pyright: ignore[reportAttributeAccessIssue]
-                )
-            elif event.t == pulsectl.PulseEventTypeEnum.change:  # pyright: ignore[reportAttributeAccessIssue]
+            if event.t in {pulsectl.PulseEventTypeEnum.new, pulsectl.PulseEventTypeEnum.change}:  # pyright: ignore[reportAttributeAccessIssue]
                 await self._handle_sink_input_update(
                     event.index,  # pyright: ignore[reportAttributeAccessIssue]
                 )
@@ -308,7 +314,8 @@ class SinkInputMonitor:
                     if self._active_sink is not None:
                         logger.info(
                             "Switching from %s to %s (only one sink can stream at a time)",
-                            self._active_sink, sink_name,
+                            self._active_sink,
+                            sink_name,
                         )
                         await self._on_deactivate(self._active_sink)
                     self._active_sink = sink_name
@@ -333,7 +340,7 @@ class SinkInputMonitor:
             logger.info("Last sink-input removed, deferring deactivation: %s", self._active_sink)
             self._cancel_deferred_deactivation()
             self._deactivation_task = asyncio.create_task(
-                self._deferred_deactivate(self._active_sink)
+                self._deferred_deactivate(self._active_sink),
             )
 
     async def _deferred_deactivate(self, sink_name: str, delay_s: int = 15) -> None:

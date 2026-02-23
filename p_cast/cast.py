@@ -41,7 +41,7 @@ class CastDiscovery:
             elif self._on_add is not None:
                 self._on_add(device_id)
 
-        def remove_callback(device_id: UUID, service: str, cast_info: object) -> None:
+        def remove_callback(device_id: UUID, service: str, cast_info: object) -> None:  # noqa: ARG001
             logger.info("[%s] removed: %s", device_id, service)
             if self._on_remove is not None:
                 self._on_remove(device_id)

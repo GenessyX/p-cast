@@ -13,20 +13,27 @@ _GRANIAN_LOG_LEVELS = {
     "ERROR": LogLevels.error,
 }
 
+MAX_AAC_BITRATE = 320
+
+
 def bitrate_ok(bitrate: str) -> bool:
     if bitrate[-1] != "k":
         return False
 
     bitrate = bitrate[:-1]
 
-    return str.isnumeric(bitrate) and float(int(bitrate)) == float(bitrate) and int(bitrate) <= 320
+    return str.isnumeric(bitrate) and float(int(bitrate)) == float(bitrate) and int(bitrate) <= MAX_AAC_BITRATE
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Cast audio from PipeWire to Chromecast")
     parser.add_argument("-b", "--bitrate", default="256k", help="audio bitrate (default: 256k)")
     parser.add_argument("-p", "--port", type=int, default=3000, help="streaming server tcp port (default: 3000)")
-    parser.add_argument("--ffmpeg", default="ffmpeg", help="path to ffmpeg binary supporting 'pulse' format (default: ffmpeg)")
+    parser.add_argument(
+        "--ffmpeg",
+        default="ffmpeg",
+        help="path to ffmpeg binary supporting 'pulse' format (default: ffmpeg)",
+    )
     parser.add_argument(
         "--log-level",
         default="INFO",
@@ -37,14 +44,14 @@ def main() -> None:
     args = parser.parse_args()
 
     if not bitrate_ok(args.bitrate):
-        print("Provided bitrate is invalid or above 320k: ", args.bitrate)
+        sys.stderr.write(f"Provided bitrate is invalid or above {MAX_AAC_BITRATE}k: {args.bitrate}\n")
         sys.exit(1)
 
     os.environ["PCAST_BITRATE"] = args.bitrate
     os.environ["PCAST_PORT"] = str(args.port)
     os.environ["PCAST_FFMPEG"] = args.ffmpeg
     os.environ["PCAST_LOG_LEVEL"] = args.log_level
-    if args.log_file != 'console':
+    if args.log_file != "console":
         os.environ["PCAST_LOG_FILE"] = args.log_file
 
     server = Server(

@@ -1,6 +1,7 @@
 from p_cast.config import StreamConfig
 
-# note, the ffmpeg executable is required, and it must support the pulse input format (--enable). check with `ffmpeg -formats | grep pulse`.
+# note, the ffmpeg executable is required, and it must support the pulse input format (--enable).
+# check with `ffmpeg -formats | grep pulse`.
 
 
 def create_ffmpeg_stream_command(

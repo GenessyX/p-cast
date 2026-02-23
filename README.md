@@ -2,7 +2,7 @@
 
 **Cast anything you can hear on your Linux desktop to any Chromecast‑compatible speaker, TV or Nest device — live, with \~3 s latency.**
 
-P‑Cast captures audio directly from PipeWire / PulseAudio, encodes it with FFmpeg and exposes the result as an HLS live stream that is played by Chromecast.
+P‑Cast captures audio directly from PipeWire / PulseAudio, encodes it as AAC with FFmpeg and exposes the result as an HLS live stream that is played by Chromecast.
 
 ## Quick start
 
@@ -154,6 +154,14 @@ This delay is primarily due to how Chromecast handles **HLS streaming**, which i
 
 * Enhance repository structure.
 * Qt tray app to control chromecast device (pause/play).
+
+## Contributing
+
+1. Install pre-commit hooks:
+
+```bash
+uv run pre-commit install
+```
 
 ## License
 

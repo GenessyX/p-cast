@@ -4,27 +4,29 @@ version = "2.0.0"
 description = "Cast audio from PipeWire to chromecast devices."
 readme = "README.md"
 classifiers = [
-    "Development Status :: 5 - Production/Stable",
-    "Intended Audience :: End Users/Desktop",
-    "Topic :: Multimedia :: Sound/Audio :: Capture/Recording",
-    "Topic :: Multimedia :: Sound/Audio :: Players",
-    "Topic :: Utilities",
-    "Environment :: Console",
-    "Operating System :: POSIX :: Linux",
-    "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.13",
-    "License :: OSI Approved :: GNU General Public License v3 (GPLv3)",
+  "Development Status :: 4 - Beta",
+  "Intended Audience :: End Users/Desktop",
+  "Topic :: Multimedia :: Sound/Audio :: Capture/Recording",
+  "Topic :: Multimedia :: Sound/Audio :: Players",
+  "Topic :: Utilities",
+  "Environment :: Console",
+  "Operating System :: POSIX :: Linux",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.13",
+  "License :: OSI Approved :: GNU General Public License v3 (GPLv3)",
 ]
 requires-python = ">=3.12"
 dependencies = [
-    "granian>=2.2.5",
-    "pulsectl-asyncio>=1.2.2",
-    "pychromecast>=14.0.7",
-    "socketify>=0.0.31",
-    "starlette>=0.46.2",
-    "typed-ffmpeg>=2.7.3",
-    "uvicorn>=0.34.2",
-    "uvloop>=0.21.0",
+  "granian>=2.2.5",
+  "pre-commit>=4.5.1",
+  "pulsectl-asyncio>=1.2.2",
+  "pychromecast>=14.0.7",
+  "ruff>=0.15.2",
+  "socketify>=0.0.31",
+  "starlette>=0.46.2",
+  "typed-ffmpeg>=2.7.3",
+  "uvicorn>=0.34.2",
+  "uvloop>=0.21.0",
 ]
 
 [project.urls]
@@ -42,14 +44,50 @@ reportUnknownMemberType = false
 
 [tool.mypy]
 overrides = [
-    { module = "pulsectl.*", ignore_missing_imports = true },
-    { module = "pulsectl_asyncio.*", ignore_missing_imports = true },
+  { module = "pulsectl.*", ignore_missing_imports = true },
+  { module = "pulsectl_asyncio.*", ignore_missing_imports = true },
 ]
 python_version = "3.13"
+namespace_packages = true
+explicit_package_bases = true
 
 [dependency-groups]
+lint = ["pre-commit>=4.5.1"]
 release = ["python-semantic-release>=9.21.1"]
-types = ["mypy>=1.15.0"]
+types = ["mypy>=1.18.2"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py312"
+exclude = ["components/moneylift/proto/moneylift"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["p_cast"]
+
+[tool.ruff.lint]
+# Allow unused variables when underscore-prefixed.
+dummy-variable-rgx = "^(_+|(_+[a-zA-Z0-9_]*[a-zA-Z0-9]+?))$"
+select = ["ALL"]
+ignore = [
+  "D",
+  "TD002",
+  "TD003",
+  "EXE",
+  "ERA",
+  "FIX",
+  "INP001",
+  "UP037",
+  "PERF401",
+  "COM812",  # conflicts with formatter
+  "BLE001",  # broad exception catches are intentional for resilience with external libs
+  "PLR0913", # failing on __init__ with only 3 args, impossible to surpress due to auto-formatting
+]
+fixable = ["ALL"]
+unfixable = []
+flake8-quotes = { inline-quotes = 'double', multiline-quotes = 'double' }
+
+[tool.ruff.format]
+quote-style = 'double'
 
 [tool.semantic_release]
 assets = []
@@ -104,25 +142,25 @@ default = "semantic-release <semantic-release>"
 minor_tags = ["feat"]
 patch_tags = ["fix", "perf"]
 other_allowed_tags = [
-    "build",
-    "chore",
-    "ci",
-    "docs",
-    "style",
-    "refactor",
-    "test",
+  "build",
+  "chore",
+  "ci",
+  "docs",
+  "style",
+  "refactor",
+  "test",
 ]
 allowed_tags = [
-    "feat",
-    "fix",
-    "perf",
-    "build",
-    "chore",
-    "ci",
-    "docs",
-    "style",
-    "refactor",
-    "test",
+  "feat",
+  "fix",
+  "perf",
+  "build",
+  "chore",
+  "ci",
+  "docs",
+  "style",
+  "refactor",
+  "test",
 ]
 default_bump_level = 0
 parse_squash_commits = false

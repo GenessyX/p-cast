@@ -9,6 +9,13 @@ from functools import partial
 from typing import override
 from uuid import UUID
 
+from pychromecast.error import RequestTimeout
+from pychromecast.socket_client import (
+    CONNECTION_STATUS_DISCONNECTED,
+    CONNECTION_STATUS_LOST,
+    ConnectionStatus,
+    ConnectionStatusListener,
+)
 from starlette.applications import Starlette
 from starlette.middleware import Middleware
 from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseEndpoint
@@ -19,27 +26,23 @@ from starlette.responses import JSONResponse, Response
 from starlette.routing import Route
 from starlette.staticfiles import StaticFiles
 
-from pychromecast.error import RequestTimeout
-from pychromecast.socket_client import (
-    ConnectionStatus,
-    ConnectionStatusListener,
-    CONNECTION_STATUS_DISCONNECTED,
-    CONNECTION_STATUS_LOST,
-)
-
 from p_cast.cast import CastDiscovery, get_local_ip, subscribe_to_stream
-from p_cast.config import StreamConfig
+from p_cast.config import MAX_SAMPLE_RATE, StreamConfig
 from p_cast.device import SinkController, SinkInputMonitor
 from p_cast.ffmpeg import create_ffmpeg_stream_command
 
 logger = logging.getLogger(__name__)
 
+_FFMPEG_STARTUP_DELAY = 0.5
+_STREAM_SUBSCRIBE_DELAY = 2
 
-async def _tcp_probe(host: str, port: int, timeout: float = 3.0) -> bool:
+
+async def _tcp_probe(host: str, port: int, probe_timeout: float = 3.0) -> bool:
     """Check if a host is accepting TCP connections. No application-level traffic."""
     try:
         _, writer = await asyncio.wait_for(
-            asyncio.open_connection(host, port), timeout=timeout
+            asyncio.open_connection(host, port),
+            timeout=probe_timeout,
         )
         writer.close()
         await writer.wait_closed()
@@ -50,20 +53,21 @@ async def _tcp_probe(host: str, port: int, timeout: float = 3.0) -> bool:
 
 class StaticFilesWithCORS(BaseHTTPMiddleware):
     """Wraps StaticFiles to add CORS headers and disable caching on HLS segment responses."""
+
     @override
     async def dispatch(
         self,
         request: Request,
         call_next: RequestResponseEndpoint,
     ) -> Response:
-        client = typing.cast("tuple[str, str]", request.scope["client"])
-        method = typing.cast("str", request.scope["method"])
-        path = typing.cast("str", request.scope["path"])
+        # client = typing.cast("tuple[str, str]", request.scope["client"])
+        # method = typing.cast("str", request.scope["method"])
+        # path = typing.cast("str", request.scope["path"])
 
         response: Response = await call_next(request)
 
-        raw_length = response.headers.get("content-length")
-        content_length = int(raw_length) / 1024 if raw_length else 0
+        # raw_length = response.headers.get("content-length")
+        # content_length = int(raw_length) / 1024 if raw_length else 0
 
         # logger.debug(
         #     "[%s:%s] %s - %s - %s KiB",
@@ -154,7 +158,7 @@ class ActiveStream:
 
 
 @contextlib.asynccontextmanager
-async def lifespan(
+async def lifespan(  # noqa: C901, PLR0915
     app: Starlette,
     controllers: dict[str, SinkController],
     stream_config: StreamConfig,
@@ -178,12 +182,12 @@ async def lifespan(
         logger.warning("Chromecast disconnected, tearing down: %s", sink_name)
         await on_deactivate(sink_name)
         controller.available = False
-        controller._cast.disconnect()
+        controller.cast.disconnect()
         await controller.remove_sink()
         await monitor.refresh_sink_indices()
         monitor.clear_active()
 
-    async def on_activate(sink_name: str) -> None:
+    async def on_activate(sink_name: str) -> None:  # noqa: C901, PLR0915
         nonlocal active_stream
 
         controller = controllers[sink_name]
@@ -193,11 +197,9 @@ async def lifespan(
 
         # Stop any leftover socket thread from the previous chromecast object.
         # No-op on first activation (socket thread not started until wait()).
-        try:
-            controller._cast.disconnect()
-        except RuntimeError:
-            pass  # that should be fine
-        cast = discovery.create_chromecast(controller._cast.uuid)
+        with contextlib.suppress(RuntimeError):
+            controller.cast.disconnect()
+        cast = discovery.create_chromecast(controller.cast.uuid)
         if cast is None:
             logger.warning("Device gone from zeroconf during activation: %s", sink_name)
             controller.available = False
@@ -205,11 +207,10 @@ async def lifespan(
             await monitor.refresh_sink_indices()
             monitor.clear_active()
             return
-        controller._cast = cast
-        try:
+        controller.cast = cast
+        with contextlib.suppress(RequestTimeout):
             await asyncio.to_thread(cast.wait, timeout=CAST_CONNECT_TIMEOUT)
-        except RequestTimeout:
-            pass  # cast.status will be None
+            # (cast.status will be None upon timeout)
 
         if cast.status is None:
             logger.warning(
@@ -224,7 +225,7 @@ async def lifespan(
             monitor.clear_active()
             return
 
-        stream_dir = tempfile.TemporaryDirectory()  # noqa: SIM115
+        stream_dir = tempfile.TemporaryDirectory()
         ffmpeg_process: asyncio.subprocess.Process | None = None
         subscribe_task: asyncio.Task[None] | None = None
         ffmpeg_watcher: asyncio.Task[None] | None = None
@@ -236,7 +237,6 @@ async def lifespan(
 
             # Generally don't resample pipewire streams; use the same rate pipewire uses (configurable in pipewire.conf)
             # Only resample if PipeWire's rate exceeds Chromecast's max (96kHz)
-            from p_cast.config import MAX_SAMPLE_RATE
             pw_rate: int = sink_info.sample_spec.rate  # pyright: ignore[reportAttributeAccessIssue, reportAssignmentType]
             sample_rate = min(pw_rate, MAX_SAMPLE_RATE) if pw_rate > MAX_SAMPLE_RATE else None
 
@@ -254,7 +254,7 @@ async def lifespan(
             )
 
             # Give FFmpeg a moment to fail on startup errors (missing libs, bad args)
-            await asyncio.sleep(0.5)
+            await asyncio.sleep(_FFMPEG_STARTUP_DELAY)
             if ffmpeg_process.returncode is not None:
                 stderr = await ffmpeg_process.stderr.read() if ffmpeg_process.stderr else b""
                 logger.error(
@@ -270,7 +270,7 @@ async def lifespan(
             app.mount("/stream", stream_app)
 
             async def subscribe() -> None:
-                await asyncio.sleep(2)
+                await asyncio.sleep(_STREAM_SUBSCRIBE_DELAY)
                 try:
                     subscribe_to_stream(cast.media_controller, local_ip, streaming_port, stream_config)
                 except Exception:
@@ -279,7 +279,7 @@ async def lifespan(
             subscribe_task = asyncio.create_task(subscribe())
 
             async def watch_ffmpeg() -> None:
-                assert ffmpeg_process is not None
+                # assert ffmpeg_process is not None  # would indicate internal error
                 await ffmpeg_process.wait()
                 if active_stream is not None and active_stream.ffmpeg_process is ffmpeg_process:
                     stderr_data = b""
@@ -290,12 +290,12 @@ async def lifespan(
                         ffmpeg_process.returncode,
                         stderr_data.decode(errors="replace").strip(),
                     )
-                    # in this case, audio is still routed to the sink but not sent to chromecast. The user will notice silence and can switch from/back to the sink to retry.
+                    # in this case, audio is still routed to the sink but not sent to chromecast.
+                    # The user will notice silence and can switch from/back to the sink to retry.
                     await on_deactivate(sink_name)
                     # Reset monitor state so re-detection can also happen on the
                     # next PulseAudio event (e.g. new sink-input or volume change)
                     monitor.clear_active()
-
 
             ffmpeg_watcher = asyncio.create_task(watch_ffmpeg())
 
@@ -337,12 +337,10 @@ async def lifespan(
         if active_stream is not None:
             logger.info("Deactivating cast from sink: %s", sink_name)
             await active_stream.teardown()
-            app.routes[:] = [
-                r for r in app.routes if not (hasattr(r, "path") and r.path == "/stream")  # type: ignore[union-attr]
-            ]
+            app.routes[:] = [r for r in app.routes if not (hasattr(r, "path") and r.path == "/stream")]
             active_stream = None
             app.state.active_controller = None
-            controllers[sink_name]._cast.disconnect()
+            controllers[sink_name].cast.disconnect()
 
     monitor = SinkInputMonitor(
         controllers=controllers,
@@ -359,17 +357,15 @@ async def lifespan(
             await on_deactivate(sink_name)
             monitor.clear_active()
         controller.available = False
-        try:
-            controller._cast.disconnect()
-        except RuntimeError:
-            pass  # socket thread was never started (device was idle)
+        with contextlib.suppress(RuntimeError):
+            controller.cast.disconnect()
         await controller.remove_sink()
         await monitor.refresh_sink_indices()
         logger.info("Device unavailable: %s", sink_name)
 
-    async def handle_device_add(device_id: UUID) -> None:
+    async def handle_device_add(device_id: UUID) -> None:  # noqa: C901
         for sink_name, controller in controllers.items():
-            if controller._cast.uuid == device_id:
+            if controller.cast.uuid == device_id:
                 if not controller.available:
                     # Cheap pre-filter: skip expensive wait() if TCP is dead
                     address = discovery.get_device_address(device_id)
@@ -399,10 +395,8 @@ async def lifespan(
                 chromecast = discovery.create_chromecast(device_id)
                 if chromecast is None:
                     return
-                try:
+                with contextlib.suppress(RequestTimeout):
                     await asyncio.to_thread(chromecast.wait, timeout=CAST_CONNECT_TIMEOUT)
-                except RequestTimeout:
-                    pass
                 chromecast.disconnect()
 
                 if chromecast.status is None:
@@ -425,18 +419,18 @@ async def lifespan(
             return
         controller = SinkController(chromecast=chromecast)
         await controller.init()
-        controllers[controller._sink_name] = controller
+        controllers[controller.sink_name] = controller
         await monitor.refresh_sink_indices()
 
     async def handle_device_remove(device_id: UUID) -> None:
         for sink_name, controller in controllers.items():
-            if controller._cast.uuid == device_id:
+            if controller.cast.uuid == device_id:
                 await mark_device_unavailable(sink_name, controller)
                 return
 
     discovery.set_callbacks(
-        on_add=lambda uuid: asyncio.run_coroutine_threadsafe(handle_device_add(uuid), loop),
-        on_remove=lambda uuid: asyncio.run_coroutine_threadsafe(handle_device_remove(uuid), loop),
+        on_add=lambda uuid: asyncio.run_coroutine_threadsafe(handle_device_add(uuid), loop),  # type: ignore[arg-type]
+        on_remove=lambda uuid: asyncio.run_coroutine_threadsafe(handle_device_remove(uuid), loop),  # type: ignore[arg-type]
     )
 
     app.state.controllers = controllers
@@ -453,15 +447,15 @@ async def lifespan(
     discovery.stop()
 
 
-def get_active_media_controller(request: Request):  # type: ignore[no-untyped-def]  # noqa: ANN201
+def _get_active_media_controller(request: Request) -> typing.Any:  # noqa: ANN401
     controller: SinkController | None = request.app.state.active_controller  # pyright: ignore[reportAny]
     if controller is None:
         return None
-    return controller._cast.media_controller
+    return controller.cast.media_controller
 
 
 async def pause(request: Request) -> Response:
-    media_controller = get_active_media_controller(request)
+    media_controller = _get_active_media_controller(request)
     if media_controller is None:
         return Response(content="No active device", status_code=404)
     media_controller.pause()
@@ -469,11 +463,11 @@ async def pause(request: Request) -> Response:
 
 
 async def play(request: Request) -> Response:
-    media_controller = get_active_media_controller(request)
+    media_controller = _get_active_media_controller(request)
     if media_controller is None:
         return Response(content="No active device", status_code=404)
     media_controller.play()
-    media_controller.seek(None)  # type: ignore[arg-type] # pyright: ignore[reportArgumentType]
+    media_controller.seek(None)  # pyright: ignore[reportArgumentType]
     return Response(content="OK")
 
 
@@ -485,7 +479,7 @@ async def devices(request: Request) -> Response:
     device_list = [
         {
             "sink_name": sink_name,
-            "friendly_name": controller._cast.name,
+            "friendly_name": controller.cast.name,
             "active": sink_name == active_sink,
             "available": controller.available,
         }
@@ -496,15 +490,20 @@ async def devices(request: Request) -> Response:
 
 def create_app() -> Starlette:
     # should all be set in main()
-    assert all(v in os.environ for v in ("PCAST_LOG_LEVEL", "PCAST_PORT", "PCAST_BITRATE", "PCAST_FFMPEG"))
+    # assert all(v in os.environ for v in ("PCAST_LOG_LEVEL", "PCAST_PORT",
+    # "PCAST_BITRATE", "PCAST_FFMPEG"))
 
     log_level = getattr(logging, os.environ["PCAST_LOG_LEVEL"], logging.INFO)
     if "PCAST_LOG_FILE" in os.environ:
-        logging.basicConfig(filename = os.environ["PCAST_LOG_FILE"], level=log_level, format="%(asctime)s %(levelname)s:%(name)s:%(message)s")
+        logging.basicConfig(
+            filename=os.environ["PCAST_LOG_FILE"],
+            level=log_level,
+            format="%(asctime)s %(levelname)s:%(name)s:%(message)s",
+        )
     else:
         logging.basicConfig(level=log_level, format="%(asctime)s %(levelname)s:%(name)s:%(message)s")
 
-    logging.info("*** p-cast instance starting ***")
+    logger.info("*** p-cast instance starting ***")
 
     discovery = CastDiscovery()
     chromecasts = discovery.discover()
@@ -521,7 +520,7 @@ def create_app() -> Starlette:
         controller = SinkController(
             chromecast=chromecast,
         )
-        controllers[controller._sink_name] = controller
+        controllers[controller.sink_name] = controller
 
     middleware = [
         Middleware(
