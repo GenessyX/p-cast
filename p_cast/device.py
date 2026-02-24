@@ -4,6 +4,7 @@ import logging
 import re
 import typing
 from collections.abc import Callable, Coroutine
+from uuid import UUID
 
 import pulsectl
 import pulsectl_asyncio
@@ -48,7 +49,8 @@ class SinkController:
         self._sink_module_id = -1
         self.available = True
         logger.info(
-            "New cc device at %s:%s registered: %s -> sink %s",
+            "New cc device %s at %s:%d registered: %s -> sink %s",
+            chromecast.uuid,
             chromecast.cast_info.host,
             chromecast.cast_info.port,
             chromecast.name,
@@ -102,6 +104,10 @@ class SinkController:
             "pulsectl.PulseSinkInfo",
             await self._pulse.get_sink_by_name(self.sink_name),
         )
+
+    @property
+    def device_id(self) -> UUID:
+        return self.cast.uuid
 
     async def get_sink_name(self) -> str:
         sink = await self.get_sink()
@@ -344,7 +350,7 @@ class SinkInputMonitor:
             )
 
     async def _deferred_deactivate(self, sink_name: str, delay_s: int = 15) -> None:
-        """Wait briefly before deactivating to handle song transitions."""
+        """Wait briefly before deactivating to handle song transitions / avoid excessive reconnects."""
         try:
             await asyncio.sleep(delay_s)
         except asyncio.CancelledError:

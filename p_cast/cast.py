@@ -1,4 +1,5 @@
 import logging
+import platform
 import socket
 import sys
 import time
@@ -27,8 +28,9 @@ class CastDiscovery:
         self._browser: CastBrowser | None = None
         self._on_add: Callable[[UUID], None] | None = None
         self._on_remove: Callable[[UUID], None] | None = None
+        self._on_update: Callable[[UUID], None] | None = None
 
-    def discover(self) -> list[pychromecast.Chromecast]:
+    def discover(self) -> list[pychromecast.Chromecast]:  # noqa: C901
         """Block for initial discovery, return found Chromecasts."""
         initial_uuids: set[UUID] = set()
         initial_phase = True
@@ -46,10 +48,18 @@ class CastDiscovery:
             if self._on_remove is not None:
                 self._on_remove(device_id)
 
+        def update_callback(device_id: UUID, service: str) -> None:
+            logger.info("[%s] updated: %s", device_id, service)
+            if initial_phase:
+                initial_uuids.add(device_id)
+            elif self._on_update is not None:
+                self._on_update(device_id)
+
         self._browser = CastBrowser(
             SimpleCastListener(
                 add_callback=add_callback,
                 remove_callback=remove_callback,
+                update_callback=update_callback,
             ),
             self._zconf,
         )
@@ -80,10 +90,12 @@ class CastDiscovery:
         self,
         on_add: Callable[[UUID], None],
         on_remove: Callable[[UUID], None],
+        on_update: Callable[[UUID], None] | None = None,
     ) -> None:
-        """Register callbacks for devices appearing/disappearing after initial discovery."""
+        """Register callbacks for devices appearing/disappearing/updating after initial discovery."""
         self._on_add = on_add
         self._on_remove = on_remove
+        self._on_update = on_update
 
     def get_device_address(self, device_id: UUID) -> tuple[str, int] | None:
         """Return (host, port) for a discovered device, or None if unknown."""
@@ -128,7 +140,7 @@ def subscribe_to_stream(
     mc.play_media(
         url,
         content_type=config.content_type,
-        title="p-cast stream",
+        title=f"p-cast stream from {platform.node()}",
         stream_type=STREAM_TYPE_LIVE,
         media_info={
             "hlsSegmentFormat": config.chromecast_hls_segment_type,

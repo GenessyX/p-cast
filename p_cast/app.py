@@ -67,7 +67,12 @@ class StaticFilesWithCORS(BaseHTTPMiddleware):
         # method = typing.cast("str", request.scope["method"])
         # path = typing.cast("str", request.scope["path"])
 
-        response: Response = await call_next(request)
+        try:
+            response: Response = await call_next(request)
+        except FileNotFoundError:
+            # Race: temp dir was cleaned up (stream teardown) while a segment
+            # request was in-flight. Return 404 rather than crashing the server.
+            return Response(status_code=404)
 
         # raw_length = response.headers.get("content-length")
         # content_length = int(raw_length) / 1024 if raw_length else 0
@@ -163,12 +168,14 @@ class BufferingWatchdog(MediaStatusListener):
         """Schedule recovery if not already pending. Called on event loop."""
         if self._timer_task is None or self._timer_task.done():
             self._timer_task = asyncio.create_task(self._recover_after_timeout())
+            logger.info("Buffering watchdog: starting recovery timer for %s", self._sink_name)
 
     def _cancel_timer(self) -> None:
         """Cancel a pending recovery timer. Called on event loop."""
         if self._timer_task is not None:
             self._timer_task.cancel()
             self._timer_task = None
+            logger.info("Buffering watchdog: cancelling recovery timer for %s", self._sink_name)
 
     async def _recover_after_timeout(self) -> None:
         try:
@@ -252,7 +259,7 @@ async def lifespan(  # noqa: C901, PLR0915
         # event loop is already processing a deactivation / device-remove.
         if not controller.available:
             return
-        logger.warning("Chromecast disconnected, tearing down: %s", sink_name)
+        logger.warning("Chromecast disconnected, tearing down sink: %s", sink_name)
         await on_deactivate(sink_name)
         controller.available = False
         controller.cast.disconnect()
@@ -272,7 +279,7 @@ async def lifespan(  # noqa: C901, PLR0915
         # No-op on first activation (socket thread not started until wait()).
         with contextlib.suppress(RuntimeError):
             controller.cast.disconnect()
-        cast = discovery.create_chromecast(controller.cast.uuid)
+        cast = discovery.create_chromecast(controller.device_id)
         if cast is None:
             logger.warning("Device gone from zeroconf during activation: %s", sink_name)
             controller.available = False
@@ -425,11 +432,11 @@ async def lifespan(  # noqa: C901, PLR0915
             controller.cast.disconnect()
         await controller.remove_sink()
         await monitor.refresh_sink_indices()
-        logger.info("Device unavailable: %s", sink_name)
+        logger.info("Device no longer available: %s (%s)", sink_name, controller.device_id)
 
     def get_controller(device_id: UUID) -> SinkController | None:
         for controller in controllers.values():
-            if controller.cast.uuid == device_id:
+            if controller.device_id == device_id:
                 return controller
         return None
 
@@ -467,7 +474,7 @@ async def lifespan(  # noqa: C901, PLR0915
 
         if chromecast.status is None:
             if controller and controller.available:
-                logger.warning("Device %s failed health check on add", controller.sink_name)
+                logger.warning("Device %s (%s) failed health check on add", controller.sink_name, device_id)
                 await mark_device_unavailable(controller.sink_name, controller)
             else:
                 logger.debug("Device %s not yet reachable at app level", device_id)
@@ -486,13 +493,38 @@ async def lifespan(  # noqa: C901, PLR0915
 
     async def handle_device_remove(device_id: UUID) -> None:
         for sink_name, controller in controllers.items():
-            if controller.cast.uuid == device_id:
+            if controller.device_id == device_id:
                 await mark_device_unavailable(sink_name, controller)
                 return
+
+    async def handle_device_update(device_id: UUID) -> None:
+        """React to mDNS update_service events to recover unavailable devices or handle IP changes.
+
+        - Unknown device: add.
+        - Unavailable device: attempt recovery (same as handle_device_add).
+        - Available device with changed IP: tear down and re-add with the new address.
+        - Available device with same IP: no-op.
+        """
+        controller = get_controller(device_id)
+        if controller is None or not controller.available:
+            await handle_device_add(device_id)
+            return
+        new_address = discovery.get_device_address(device_id)
+        current_address = (controller.cast.cast_info.host, controller.cast.cast_info.port)
+        if new_address is not None and new_address != current_address:
+            logger.info(
+                "Device %s address changed: %s:%d -> %s:%d, re-adding",
+                controller.sink_name,
+                *current_address,
+                *new_address,
+            )
+            await mark_device_unavailable(controller.sink_name, controller)
+            await handle_device_add(device_id)
 
     discovery.set_callbacks(
         on_add=lambda uuid: asyncio.run_coroutine_threadsafe(handle_device_add(uuid), loop),  # type: ignore[arg-type]
         on_remove=lambda uuid: asyncio.run_coroutine_threadsafe(handle_device_remove(uuid), loop),  # type: ignore[arg-type]
+        on_update=lambda uuid: asyncio.run_coroutine_threadsafe(handle_device_update(uuid), loop),  # type: ignore[arg-type]
     )
 
     app.state.controllers = controllers
@@ -565,7 +597,7 @@ def create_app() -> Starlette:
     else:
         logging.basicConfig(level=log_level, format="%(asctime)s %(levelname)s:%(name)s:%(message)s")
 
-    logger.info("*** p-cast instance starting ***")
+    logger.info("\n\n*** p-cast instance starting ***\n")
 
     discovery = CastDiscovery()
     chromecasts = discovery.discover()
