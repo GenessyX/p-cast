@@ -1,0 +1,28 @@
+[Unit]
+Description=p-cast: stream PipeWire audio to Chromecast
+After=network.target pipewire.service pipewire-pulse.service
+ConditionUser=!root
+
+# Start with `systemctl --user start p-cast`
+#
+# Type=forking — tells systemd to expect the parent process to exit, then track the PID written to PIDFile=.
+# PIDFile=%t/p-cast/p-cast.pid — %t expands to /run/user/<uid>.
+# RuntimeDirectory=p-cast — creates /run/user/<uid>/p-cast/ automatically (for the PID file); cleaned up on logout.
+# StateDirectory=p-cast — creates ~/.local/state/p-cast/ automatically (for the log file); persistent across reboots.
+# Restart=on-failure / RestartSec=10 — restarts if p-cast crashes or if Chromecast discovery fails at boot before the devices are online.
+# WantedBy=default.target — correct target for user services (vs multi-user.target for system services).
+
+[Service]
+Type=forking
+PIDFile=%t/p-cast/p-cast.pid
+RuntimeDirectory=p-cast
+StateDirectory=p-cast
+ExecStart=%h/.local/bin/p-cast \
+    --daemonize \
+    --pid-file %t/p-cast/p-cast.pid \
+    --log-file %h/.local/state/p-cast/p-cast.log
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=default.target
