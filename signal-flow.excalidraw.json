@@ -1,0 +1,49 @@
+{
+  "title": "p-cast Signal Flow",
+  "width": 1480,
+  "height": 680,
+  "background": "#FAF8F5",
+  "elements": [
+    {
+      "type": "text",
+      "x": 765, "y": 22,
+      "text": "p-cast Signal Flow",
+      "fontSize": 26,
+      "subtitle": "Chromecast · Controller · Sink interactions"
+    },
+
+    { "type": "rectangle", "id": "pw",   "x": 50,   "y": 90,  "width": 170, "height": 80,  "label": "PipeWire / PA",         "fill": "#ffd8a8", "rounded": true },
+    { "type": "rectangle", "id": "sc",   "x": 325,  "y": 80,  "width": 210, "height": 100, "label": "SinkController",        "annotation": "null-sink | volume→Chromecast", "fill": "#b2f2bb", "rounded": true },
+    { "type": "rectangle", "id": "sim",  "x": 40,   "y": 240, "width": 215, "height": 110, "label": "SinkInput Monitor",     "annotation": "sink-input new/change/remove", "fill": "#99e9f2", "rounded": true },
+
+    { "type": "rectangle", "id": "cd",   "x": 325,  "y": 555, "width": 185, "height": 100, "label": "CastDiscovery",         "annotation": "CastBrowser | SimpleCastListener", "fill": "#a5d8ff", "rounded": true },
+    { "type": "rectangle", "id": "zc",   "x": 40,   "y": 565, "width": 185, "height": 80,  "label": "Zeroconf / mDNS",       "fill": "#dee2e6", "rounded": true },
+
+    { "type": "rectangle", "id": "app",  "x": 470,  "y": 310, "width": 250, "height": 140, "label": "App Orchestrator",      "annotation": "manage chromecasts, PA sinks, playback and volume", "fill": "#d0bfff", "rounded": true },
+
+    { "type": "rectangle", "id": "cl",   "x": 890,  "y": 80,  "width": 225, "height": 100, "label": "Connection Listener",   "annotation": "LOST/DISCONNECTED", "fill": "#ffd8a8", "rounded": true },
+    { "type": "rectangle", "id": "cast", "x": 1245, "y": 310, "width": 200, "height": 140, "label": "Chromecast device",     "annotation": "media_controller | HLS player | volume→sink", "fill": "#fcc2d7", "rounded": false },
+    { "type": "rectangle", "id": "bw",   "x": 890,  "y": 195, "width": 225, "height": 110, "label": "Buffering Watchdog",    "annotation": "BUFFERING timeout → restart_stream", "fill": "#ffec99", "rounded": true },
+
+    { "type": "rectangle", "id": "ff",   "x": 700,  "y": 555, "width": 230, "height": 100, "label": "FFmpeg",                "annotation": "stream audio: read sink.monitor | write HLS", "fill": "#ffec99", "rounded": true },
+    { "type": "rectangle", "id": "td",   "x": 1010, "y": 555, "width": 185, "height": 100, "label": "HLS TempDir",           "annotation": ".ts segments + m3u8", "fill": "#b2f2bb", "rounded": true },
+    { "type": "rectangle", "id": "http", "x": 1255, "y": 555, "width": 185, "height": 100, "label": "HTTP Server",           "annotation": "/stream/* at provided port", "fill": "#a5d8ff", "rounded": true },
+
+
+    { "type": "arrow", "from": "zc",   "to": "cd",   "label": "mDNS events" },
+    { "type": "arrow", "from": "cd",   "to": "app",  "label": "on_add/remove/update",       "fromSide": "top",  "toSide": "bottom" },
+    { "type": "arrow", "from": "app",  "to": "sc",   "label": "create/remove sink",         "fromSide": "top",    "toSide": "bottom" },
+    { "type": "arrow", "from": "pw",   "to": "sc",   "label": "volume events",              "fromSide": "right",  "toSide": "left" },
+    { "type": "arrow", "from": "app",  "to": "ff",   "label": "spawn process",              "fromSide": "bottom", "toSide": "top" },
+    { "type": "arrow", "from": "ff",   "to": "td",   "label": "writes .ts" },
+    { "type": "arrow", "from": "td",   "to": "http", "label": "serves",                     "fromSide": "right",  "toSide": "left" },
+    { "type": "arrow", "from": "http", "to": "cast", "label": "requested HLS segments",    "fromSide": "top",    "toSide": "bottom" },
+    { "type": "arrow", "from": "app",  "to": "cast", "label": "play_media(), set_volume()", "fromSide": "right",  "toSide": "left" },
+    { "type": "arrow", "from": "pw",   "to": "sim",  "label": "sink-input events",          "fromSide": "bottom", "toSide": "top" },
+    { "type": "arrow", "from": "sim",  "to": "app",  "label": "on_activate/on_deactivate",  "fromSide": "right",  "toSide": "left" },
+    { "type": "arrow", "from": "cast", "to": "cl",   "label": "new_connection_status",      "fromSide": "top",    "toSide": "right" },
+    { "type": "arrow", "from": "cl",   "to": "app",  "label": "on_disconnect",              "fromSide": "left",   "toSide": "top" },
+    { "type": "arrow", "from": "cast", "to": "bw",   "label": "new_media_status",           "fromSide": "left",   "toSide": "right" },
+    { "type": "arrow", "from": "bw",   "to": "app",  "label": "restart_stream",             "fromSide": "left",   "toSide": "right" }
+  ]
+}
