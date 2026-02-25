@@ -4,11 +4,13 @@ import logging
 import re
 import typing
 from collections.abc import Callable, Coroutine
+from typing import override
 from uuid import UUID
 
 import pulsectl
 import pulsectl_asyncio
 from pychromecast import Chromecast
+from pychromecast.controllers.receiver import CastStatus, CastStatusListener
 
 from p_cast.exceptions import SinkError
 
@@ -30,6 +32,36 @@ def _make_sink_name(chromecast_name: str) -> str:
 
 def _make_friendly_sink_name(chromecast_name: str) -> str:
     return f"{chromecast_name} Cast"
+
+
+class _CastVolumeSync(CastStatusListener):
+    """Bridges Chromecast-initiated volume/mute changes back to the PA sink.
+
+    new_cast_status() runs on pychromecast's socket thread; the apply
+    coroutine is scheduled onto the event loop via run_coroutine_threadsafe.
+    """
+
+    def __init__(
+        self,
+        loop: asyncio.AbstractEventLoop,
+        on_volume_change: Callable[[float, bool], Coroutine[None, None, None]],
+    ) -> None:
+        self._loop = loop
+        self._on_volume_change = on_volume_change
+        self._active = True
+
+    def deactivate(self) -> None:
+        self._active = False
+
+    @override
+    def new_cast_status(self, status: CastStatus) -> None:
+        if not self._active:
+            return
+        level = status.volume_level
+        muted = status.volume_muted
+        if level is None:
+            return
+        asyncio.run_coroutine_threadsafe(self._on_volume_change(level, muted), self._loop)
 
 
 class SinkController:
@@ -63,8 +95,13 @@ class SinkController:
         self._sink_module_id = await self.create_sink(self.sink_name, self._sink_friendly_name)
 
     async def start_volume_sync(self) -> None:
+        self._synced_volume: float | None = None
+        self._synced_mute: bool | None = None
         self._volume_listener = asyncio.create_task(self._subscribe_volume())
         self._volume_listener.add_done_callback(self._on_volume_listener_done)
+        loop = asyncio.get_running_loop()
+        self._cast_volume_sync = _CastVolumeSync(loop=loop, on_volume_change=self._apply_cast_volume)
+        self.cast.register_status_listener(self._cast_volume_sync)
 
     @staticmethod
     def _on_volume_listener_done(task: asyncio.Task[None]) -> None:
@@ -75,6 +112,8 @@ class SinkController:
             logger.error("Volume sync crashed: %s", exc, exc_info=exc)
 
     async def stop_volume_sync(self) -> None:
+        if hasattr(self, "_cast_volume_sync"):
+            self._cast_volume_sync.deactivate()
         if hasattr(self, "_volume_listener"):
             self._volume_listener.cancel()
 
@@ -147,6 +186,30 @@ class SinkController:
     def get_mute(self, sink: pulsectl.PulseSinkInfo) -> bool:
         return bool(sink.mute)  # pyright: ignore[reportAttributeAccessIssue]
 
+    async def _apply_cast_volume(self, level: float, muted: bool) -> None:  # noqa: FBT001
+        """Apply a Chromecast-initiated volume/mute change to the PA sink.
+
+        Skips the update if the values are already in sync (e.g. an echo of our
+        own set_volume call), preventing feedback loops with _subscribe_volume.
+        """
+        volume_epsilon = 0.005  # less than a single volume-up/down step
+        level_changed = self._synced_volume is None or abs(level - self._synced_volume) > volume_epsilon
+        mute_changed = self._synced_mute is None or muted != self._synced_mute
+        if not level_changed and not mute_changed:
+            return
+        try:
+            sink = await self.get_sink()
+            if level_changed:
+                logger.debug("Cast volume change → PA sink %s: %.3f", self.sink_name, level)
+                self._synced_volume = level
+                await self._pulse.volume_set_all_chans(sink, level)
+            if mute_changed:
+                logger.debug("Cast mute change → PA sink %s: %s", self.sink_name, muted)
+                self._synced_mute = muted
+                await self._pulse.mute(sink, mute=muted)
+        except Exception:
+            logger.warning("Failed to apply cast volume to PA sink", exc_info=True)
+
     async def _subscribe_volume(self) -> None:  # noqa: C901
         sink = await self.get_sink()
 
@@ -166,8 +229,8 @@ class SinkController:
         except Exception:
             logger.warning("Failed to initialize sink volume from Chromecast", exc_info=True)
 
-        current_volume = self.get_volume(sink)
-        current_mute = self.get_mute(sink)
+        self._synced_volume = self.get_volume(sink)
+        self._synced_mute = self.get_mute(sink)
 
         async for event in self._pulse.subscribe_events(
             pulsectl.PulseEventMaskEnum.sink,  # pyright: ignore[reportAttributeAccessIssue]
@@ -181,12 +244,12 @@ class SinkController:
             changed_volume = self.get_volume(changed_sink)
             changed_mute = self.get_mute(changed_sink)
             try:
-                if changed_volume != current_volume:
+                if changed_volume != self._synced_volume:
                     self.cast.set_volume(volume=changed_volume)
-                    current_volume = changed_volume
-                if changed_mute != current_mute:
+                    self._synced_volume = changed_volume
+                if changed_mute != self._synced_mute:
                     self.cast.set_volume_muted(muted=changed_mute)
-                    current_mute = changed_mute
+                    self._synced_mute = changed_mute
             except Exception:
                 logger.warning("Failed to sync volume to Chromecast", exc_info=True)
 
