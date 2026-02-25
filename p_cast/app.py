@@ -440,15 +440,28 @@ async def lifespan(  # noqa: C901, PLR0915
                 return controller
         return None
 
+    def address_matches(controller: SinkController, new_address: tuple[str, int]) -> bool:
+        current_address = (controller.cast.cast_info.host, controller.cast.cast_info.port)
+        return new_address == current_address
+
     async def handle_device_add(device_id: UUID) -> None:
+        """React to mDNS add_service or update_service events to recover previously unavailable devices,
+        mark newly unreachable devices unavailable, and handle potential IP changes."""
         controller = get_controller(device_id)
-        if controller and not controller.available:
-            # Cheap pre-filter: skip expensive wait() if TCP is dead
-            address = discovery.get_device_address(device_id)
-            if address is None:
+        if controller:
+            new_address = discovery.get_device_address(device_id)
+            if new_address is None:
                 return
-            if not await _tcp_probe(*address):
-                logger.debug("TCP probe failed for %s at %s:%d", controller.sink_name, *address)
+            if controller.available and not address_matches(controller, new_address):
+                logger.info(
+                    "Device %s address changed to: %s:%d, re-adding",
+                    controller.sink_name,
+                    *new_address,
+                )
+                await mark_device_unavailable(controller.sink_name, controller)
+            elif not controller.available and not await _tcp_probe(*new_address):
+                # Cheap pre-filter: skip expensive wait() if TCP is dead
+                logger.debug("TCP probe failed for %s at %s:%d", controller.sink_name, *new_address)
                 return
 
         # Before (re-)adding, ensure we can actually connect at the application level
@@ -474,7 +487,7 @@ async def lifespan(  # noqa: C901, PLR0915
 
         if chromecast.status is None:
             if controller and controller.available:
-                logger.warning("Device %s (%s) failed health check on add", controller.sink_name, device_id)
+                logger.warning("Device %s (%s) failed health check on add/update", controller.sink_name, device_id)
                 await mark_device_unavailable(controller.sink_name, controller)
             else:
                 logger.debug("Device %s not yet reachable at app level", device_id)
@@ -497,34 +510,10 @@ async def lifespan(  # noqa: C901, PLR0915
                 await mark_device_unavailable(sink_name, controller)
                 return
 
-    async def handle_device_update(device_id: UUID) -> None:
-        """React to mDNS update_service events to recover unavailable devices or handle IP changes.
-
-        - Unknown device: add.
-        - Unavailable device: attempt recovery (same as handle_device_add).
-        - Available device with changed IP: tear down and re-add with the new address.
-        - Available device with same IP: no-op.
-        """
-        controller = get_controller(device_id)
-        if controller is None or not controller.available:
-            await handle_device_add(device_id)
-            return
-        new_address = discovery.get_device_address(device_id)
-        current_address = (controller.cast.cast_info.host, controller.cast.cast_info.port)
-        if new_address is not None and new_address != current_address:
-            logger.info(
-                "Device %s address changed: %s:%d -> %s:%d, re-adding",
-                controller.sink_name,
-                *current_address,
-                *new_address,
-            )
-            await mark_device_unavailable(controller.sink_name, controller)
-            await handle_device_add(device_id)
-
     discovery.set_callbacks(
         on_add=lambda uuid: asyncio.run_coroutine_threadsafe(handle_device_add(uuid), loop),  # type: ignore[arg-type]
         on_remove=lambda uuid: asyncio.run_coroutine_threadsafe(handle_device_remove(uuid), loop),  # type: ignore[arg-type]
-        on_update=lambda uuid: asyncio.run_coroutine_threadsafe(handle_device_update(uuid), loop),  # type: ignore[arg-type]
+        on_update=lambda uuid: asyncio.run_coroutine_threadsafe(handle_device_add(uuid), loop),  # type: ignore[arg-type]
     )
 
     app.state.controllers = controllers
