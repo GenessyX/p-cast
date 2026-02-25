@@ -11,6 +11,7 @@ ConditionUser=!root
 # StateDirectory=p-cast — creates ~/.local/state/p-cast/ automatically (for the log file); persistent across reboots.
 # Restart=on-failure / RestartSec=10 — restarts if p-cast crashes or if Chromecast discovery fails at boot before the devices are online.
 # WantedBy=default.target — correct target for user services (vs multi-user.target for system services).
+# TimeoutStopSec=15 — gives p-cast 15 seconds to stop cleanly before systemd force-kills it
 
 [Service]
 Type=forking
@@ -23,6 +24,7 @@ ExecStart=%h/.local/bin/p-cast \
     --log-file %h/.local/state/p-cast/p-cast.log
 Restart=on-failure
 RestartSec=10
+TimeoutStopSec=15
 
 [Install]
 WantedBy=default.target

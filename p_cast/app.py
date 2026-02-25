@@ -227,6 +227,8 @@ class ActiveStream:
         self.connection_listener.deactivate()
         self.buffering_watchdog.cancel()
         self.subscribe_task.cancel()
+        with contextlib.suppress(Exception):
+            self.volume_controller.cast.quit_app()
         if self.ffmpeg_process.returncode is None:
             self.ffmpeg_process.terminate()
             await self.ffmpeg_process.wait()
@@ -519,6 +521,32 @@ async def lifespan(  # noqa: C901, PLR0915
     app.state.controllers = controllers
     app.state.monitor = monitor
     app.state.active_controller = None
+
+    async def _sigterm_handler() -> None:
+        nonlocal active_stream
+        logger.info("SIGTERM received, running cleanup")
+        # Claim active_stream so the post-yield path skips it if both paths run.
+        _stream, active_stream = active_stream, None
+        with contextlib.suppress(Exception):
+            if _stream is not None:
+                await asyncio.wait_for(_stream.teardown(), timeout=5.0)
+        with contextlib.suppress(Exception):
+            await asyncio.wait_for(monitor.stop(), timeout=3.0)
+        for ctrl in list(controllers.values()):
+            with contextlib.suppress(Exception):
+                await asyncio.wait_for(ctrl.close(), timeout=3.0)
+        with contextlib.suppress(Exception):
+            await asyncio.wait_for(asyncio.to_thread(discovery.stop), timeout=3.0)
+        os._exit(0)
+
+    # Granian's Rust/Tokio layer seems to block SIGTERM process-wide for signalfd use.
+    # Unblocking it in the event-loop thread and registering an asyncio handler
+    # gives us a reliable shutdown path that bypasses any signalfd issues.
+    try:
+        signal.pthread_sigmask(signal.SIG_UNBLOCK, {signal.SIGTERM})
+        loop.add_signal_handler(signal.SIGTERM, lambda: asyncio.create_task(_sigterm_handler()))
+    except Exception:
+        logger.debug("Could not install SIGTERM handler in event loop", exc_info=True)
 
     yield
 
