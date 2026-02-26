@@ -269,7 +269,7 @@ async def lifespan(  # noqa: C901, PLR0915
         await monitor.refresh_sink_indices()
         monitor.clear_active()
 
-    async def on_activate(sink_name: str) -> None:  # noqa: PLR0915
+    async def on_activate(sink_name: str) -> None:  # noqa: PLR0915, C901
         nonlocal active_stream
 
         controller = controllers[sink_name]
@@ -338,6 +338,9 @@ async def lifespan(  # noqa: C901, PLR0915
             # An immediate exit is a programming or configuration error — shut down.
             await asyncio.sleep(_FFMPEG_STARTUP_DELAY)
             if ffmpeg_process.returncode is not None:
+                if _shutting_down:
+                    # FFmpeg was killed by the SIGTERM handler; don't re-signal.
+                    return
                 stderr = await ffmpeg_process.stderr.read() if ffmpeg_process.stderr else b""
                 logger.error(
                     "FFmpeg exited immediately (code %d): %s — shutting down",
@@ -346,7 +349,7 @@ async def lifespan(  # noqa: C901, PLR0915
                 )
                 cast.disconnect()
                 stream_dir.cleanup()
-                # trigger graceful uvicorn shutdown handler
+                # trigger graceful shutdown handler
                 os.kill(os.getpid(), signal.SIGTERM)
                 return
 
@@ -522,8 +525,13 @@ async def lifespan(  # noqa: C901, PLR0915
     app.state.monitor = monitor
     app.state.active_controller = None
 
+    _shutting_down = False
+
     async def _sigterm_handler() -> None:
-        nonlocal active_stream
+        nonlocal active_stream, _shutting_down
+        if _shutting_down:
+            return
+        _shutting_down = True
         logger.info("SIGTERM received, running cleanup")
         # Claim active_stream so the post-yield path skips it if both paths run.
         _stream, active_stream = active_stream, None
