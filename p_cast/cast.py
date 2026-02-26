@@ -1,7 +1,6 @@
 import logging
 import platform
 import socket
-import sys
 import time
 import typing
 from collections.abc import Callable
@@ -67,10 +66,6 @@ class CastDiscovery:
         time.sleep(2)
         initial_phase = False
 
-        if not initial_uuids:
-            logger.error("No Chromecasts found")
-            sys.exit(1)
-
         chromecasts: list[pychromecast.Chromecast] = []
         for uuid in initial_uuids:
             cast_info = self._browser.devices.get(uuid)
@@ -81,8 +76,7 @@ class CastDiscovery:
             chromecasts.append(cc)
 
         if not chromecasts:
-            logger.error("No Chromecasts could be connected")
-            sys.exit(1)
+            logger.warning("No Chromecasts found, or could be connected, at startup")
 
         return chromecasts
 
@@ -141,8 +135,20 @@ def subscribe_to_stream(
         url,
         content_type=config.content_type,
         title=f"p-cast stream from {platform.node()}",
+        # thumb=album_image_url,
         stream_type=STREAM_TYPE_LIVE,
         media_info={
             "hlsSegmentFormat": config.chromecast_hls_segment_type,
         },
+        # metadata={
+        #     "metadataType": pychromecast.controllers.media.METADATA_TYPE_MUSICTRACK,  # 3
+        #     "albumArtist": "",
+        #     "albumName": "",
+        #     "artist": "",
+        #     "composer": "",
+        #     "discNumber": "",
+        #     "releaseDate": "", # ISO8601, ie 2030-01-31
+        #     "title": "",
+        #     "trackNum": ""
+        # },
     )

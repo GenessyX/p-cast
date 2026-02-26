@@ -29,4 +29,4 @@ class StreamConfig:
 
     @property
     def content_type(self) -> str:
-        return "application/vnd.apple.mpegurl"
+        return "application/vnd.apple.mpegurl"  # HLS

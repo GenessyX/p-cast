@@ -165,9 +165,9 @@ class BufferingWatchdog(MediaStatusListener):
     def new_media_status(self, status: MediaStatus) -> None:
         if not self._active:
             return
-        if status.player_state == "BUFFERING":
+        if status.player_state in "BUFFERING":
             self._loop.call_soon_threadsafe(self._start_timer)
-        else:
+        else:  # PAUSED, PLAYING, IDLE, UNKNOWN
             self._loop.call_soon_threadsafe(self._cancel_timer)
 
     @override
@@ -176,7 +176,7 @@ class BufferingWatchdog(MediaStatusListener):
             "Media load failed for %s (queue_item=%d, error=%d)",
             self._sink_name,
             queue_item_id,
-            error_code,
+            error_code,  # see pychromecast.controllers.media.MEDIA_PLAYER_ERROR_CODES for interpretation
         )
 
     def _start_timer(self) -> None:
@@ -243,7 +243,8 @@ class ActiveStream:
         self.buffering_watchdog.cancel()
         self.subscribe_task.cancel()
         with contextlib.suppress(Exception):
-            self.volume_controller.cast.quit_app()
+            # tell it to stop, but don't quit() the CC app (and trigger a disconnect)
+            self.volume_controller.cast.media_controller.stop(timeout=1.0)
         if self.ffmpeg_process.returncode is None:
             self.ffmpeg_process.terminate()
             await self.ffmpeg_process.wait()
@@ -266,7 +267,7 @@ async def lifespan(  # noqa: C901, PLR0915
         await controller.init()
 
     active_stream: ActiveStream | None = None
-    local_ip = get_local_ip()
+    local_ip = None  # defer initialization until we have devices (and thus a network up)
     loop = asyncio.get_running_loop()
 
     async def handle_cast_disconnect(sink_name: str) -> None:
@@ -279,23 +280,28 @@ async def lifespan(  # noqa: C901, PLR0915
         logger.warning("Chromecast disconnected, tearing down sink: %s", sink_name)
         await on_deactivate(sink_name)
         controller.available = False
-        controller.cast.disconnect()
+        with contextlib.suppress(TimeoutError):
+            controller.cast.disconnect(timeout=0.0)
         await controller.remove_sink()
         await monitor.refresh_sink_indices()
         monitor.clear_active()
 
     async def on_activate(sink_name: str) -> None:  # noqa: PLR0915, C901
         nonlocal active_stream
+        nonlocal local_ip
 
         controller = controllers[sink_name]
         if not controller.available:
             logger.warning("Skipping activation for unavailable device: %s", sink_name)
             return
 
+        if not local_ip:
+            local_ip = get_local_ip()
+
         # Stop any leftover socket thread from the previous chromecast object.
         # No-op on first activation (socket thread not started until wait()).
-        with contextlib.suppress(RuntimeError):
-            controller.cast.disconnect()
+        with contextlib.suppress(RuntimeError, TimeoutError):
+            controller.cast.disconnect(timeout=0.0)
         cast = discovery.create_chromecast(controller.device_id)
         if cast is None:
             logger.warning("Device gone from zeroconf during activation: %s", sink_name)
@@ -316,7 +322,8 @@ async def lifespan(  # noqa: C901, PLR0915
                 sink_name,
             )
             controller.available = False
-            cast.disconnect()
+            with contextlib.suppress(TimeoutError):
+                cast.disconnect(timeout=0.0)
             await controller.remove_sink()
             await monitor.refresh_sink_indices()
             monitor.clear_active()
@@ -362,7 +369,8 @@ async def lifespan(  # noqa: C901, PLR0915
                     ffmpeg_process.returncode,
                     stderr.decode(errors="replace").strip(),
                 )
-                cast.disconnect()
+                with contextlib.suppress(TimeoutError):
+                    cast.disconnect(timeout=0.0)
                 stream_dir.cleanup()
                 # trigger graceful shutdown handler
                 os.kill(os.getpid(), signal.SIGTERM)
@@ -371,6 +379,13 @@ async def lifespan(  # noqa: C901, PLR0915
             logger.debug("Publishing audio stream for chromecast")
             stream_app = StaticFilesWithCORS(StaticFiles(directory=stream_dir.name))
             app.mount("/stream", stream_app)
+
+            buffering_watchdog = BufferingWatchdog(
+                loop=loop,
+                sink_name=sink_name,
+                on_recover=restart_stream,
+            )
+            cast.media_controller.register_status_listener(buffering_watchdog)
 
             async def subscribe() -> None:
                 await asyncio.sleep(_STREAM_SUBSCRIBE_DELAY)
@@ -389,13 +404,6 @@ async def lifespan(  # noqa: C901, PLR0915
                 on_disconnect=handle_cast_disconnect,
             )
             cast.register_connection_listener(connection_listener)
-
-            buffering_watchdog = BufferingWatchdog(
-                loop=loop,
-                sink_name=sink_name,
-                on_recover=restart_stream,
-            )
-            cast.media_controller.register_status_listener(buffering_watchdog)
 
             active_stream = ActiveStream(
                 ffmpeg_process=ffmpeg_process,
@@ -427,7 +435,8 @@ async def lifespan(  # noqa: C901, PLR0915
             app.routes[:] = [r for r in app.routes if not (hasattr(r, "path") and r.path == "/stream")]
             active_stream = None
             app.state.active_controller = None
-            controllers[sink_name].cast.disconnect()
+            with contextlib.suppress(TimeoutError):
+                controllers[sink_name].cast.disconnect(timeout=0.0)
 
     async def restart_stream(sink_name: str) -> None:
         await on_deactivate(sink_name)
@@ -448,8 +457,8 @@ async def lifespan(  # noqa: C901, PLR0915
             await on_deactivate(sink_name)
             monitor.clear_active()
         controller.available = False
-        with contextlib.suppress(RuntimeError):
-            controller.cast.disconnect()
+        with contextlib.suppress(RuntimeError, TimeoutError):  # expect timeout; ok if cast is unset
+            controller.cast.disconnect(timeout=0.0)
         await controller.remove_sink()
         await monitor.refresh_sink_indices()
         logger.info("Device no longer available: %s (%s)", sink_name, controller.device_id)
@@ -464,7 +473,20 @@ async def lifespan(  # noqa: C901, PLR0915
         current_address = (controller.cast.cast_info.host, controller.cast.cast_info.port)
         return new_address == current_address
 
+    _handling_devices: set[UUID] = set()
+
     async def handle_device_add(device_id: UUID) -> None:
+        """Guard to prevent simultaneous adds of the same device"""
+        if device_id in _handling_devices:
+            logger.debug("Skipping concurrent device_add of %s", device_id)
+            return
+        _handling_devices.add(device_id)
+        try:
+            await _handle_device_add(device_id)
+        finally:
+            _handling_devices.discard(device_id)
+
+    async def _handle_device_add(device_id: UUID) -> None:
         """React to mDNS add_service or update_service events to recover previously unavailable devices,
         mark newly unreachable devices unavailable, and handle potential IP changes."""
         controller = get_controller(device_id)
@@ -503,7 +525,8 @@ async def lifespan(  # noqa: C901, PLR0915
             return
         with contextlib.suppress(RequestTimeout):
             await asyncio.to_thread(chromecast.wait, timeout=CAST_CONNECT_TIMEOUT)
-        chromecast.disconnect()
+        with contextlib.suppress(TimeoutError):
+            chromecast.disconnect(timeout=0.0)
 
         if chromecast.status is None:
             if controller and controller.available:

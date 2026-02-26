@@ -77,7 +77,7 @@ Note: Ensure that the chosen port (3000 by default) is open for incoming connect
 
 Dependencies are declared in **pyproject.toml**. We prefer [**uv**](https://github.com/astral-sh/uv) but regular `pip` works just as well.
 
-Your **firewall** must not block your Chromecast from reaching your chosen local TCP port.
+Your **firewall** must not block your Chromecast from reaching your chosen local TCP port, or mDNS discovery (5353/UDP).
 
 ## Run as a systemd service
 
@@ -182,6 +182,7 @@ This delay is primarily due to how Chromecast handles **HLS streaming**, which i
 * Enhance repository structure.
 * Show currently playing media on chromecast (title/artist/album cover)
 * Qt tray app to control chromecast device (pause/play).
+* When switching between our own chromecast sinks, retain the ffmpeg/http components rather than stopping and re-creating, if possible
 
 ## Contributing
 
