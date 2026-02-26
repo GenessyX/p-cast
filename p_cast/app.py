@@ -3,6 +3,7 @@ import contextlib
 import logging
 import os
 import signal
+import socket
 import tempfile
 import typing
 from collections.abc import AsyncIterator, Callable, Coroutine
@@ -34,6 +35,20 @@ from p_cast.device import SinkController, SinkInputMonitor
 from p_cast.ffmpeg import create_ffmpeg_stream_command
 
 logger = logging.getLogger(__name__)
+
+
+def _sd_notify(state: str) -> None:
+    """Send a sd_notify(3) message if running under systemd (NOTIFY_SOCKET is set)."""
+    sock_path = os.environ.get("NOTIFY_SOCKET")
+    if not sock_path:
+        logger.info("NOTIFY_SOCKET not set, skipping sd_notify")
+
+        return
+    logger.info("Sending sd_notify(%s) to systemd", state)
+    addr = "\0" + sock_path[1:] if sock_path.startswith("@") else sock_path
+    with socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM) as sock:
+        sock.sendto(state.encode(), addr)
+
 
 _FFMPEG_STARTUP_DELAY = 0.5
 _STREAM_SUBSCRIBE_DELAY = 2
@@ -556,6 +571,8 @@ async def lifespan(  # noqa: C901, PLR0915
     except Exception:
         logger.debug("Could not install SIGTERM handler in event loop", exc_info=True)
 
+    # notify systemd that we are up (if applicable)
+    _sd_notify("READY=1")
     yield
 
     if active_stream is not None:

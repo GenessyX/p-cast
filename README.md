@@ -9,8 +9,8 @@ P‑Cast captures audio directly from PipeWire / PulseAudio, encodes it as AAC w
 Install p-cast with [uv](https://docs.astral.sh/uv/getting-started/installation/), and run it as needed, or at startup:
 
     ```bash
-    uv tool install p-cast  # once
-    p-cast                  # every time you want to use it (see optional arguments below)
+    uv tool install p-cast  # once to install
+    p-cast                  # when you want to use it (see optional arguments below)
     ```
 
 **THEN** while running, under system Sound Settings, simply choose the Chromecast device of your choice (set it as default sink or route an app explicitly). Audio will be cast to your device.
@@ -43,30 +43,6 @@ Note: Ensure that the chosen port (3000 by default) is open for incoming connect
     pip install .
     python p_cast
     ```
-
-### As a systemd service
-
-This will run p-cast as a user service.
-
-Install and enable the [service](p-cast.service) to run at boot:
-
-```bash
-# Adjust ExecStart path if p-cast isn't at ~/.local/bin/p-cast
-# Add any additional arguments to ExectStart as desired
-cp p-cast.service ~/.config/systemd/user/
-systemctl --user daemon-reload
-
-# Enable service running at startup
-systemctl --user enable --now p-cast
-```
-
-Start / Stop / check Status (*choose one!*):
-
-```bash
-systemctl --user [start|stop|status] p-cast
-```
-
-Check logs at `~/.local/state/p-cast/p-cast.log`
 
 ## Features
 
@@ -102,6 +78,30 @@ Check logs at `~/.local/state/p-cast/p-cast.log`
 Dependencies are declared in **pyproject.toml**. We prefer [**uv**](https://github.com/astral-sh/uv) but regular `pip` works just as well.
 
 Your **firewall** must not block your Chromecast from reaching your chosen local TCP port.
+
+## Run as a systemd service
+
+After installing p-cast, it can be set up as a as a user service using systemd.
+
+Install and enable the [service](p-cast.service) to run at boot:
+
+```bash
+# Adjust ExecStart path if p-cast isn't at ~/.local/bin/p-cast
+# Add any additional arguments to ExectStart as desired
+cp p-cast.service ~/.config/systemd/user/
+systemctl --user daemon-reload
+
+# Enable service running at startup
+systemctl --user enable --now p-cast
+```
+
+Start / Stop / check Status (*choose one!*):
+
+```bash
+systemctl --user [start|stop|status] p-cast
+```
+
+Check logs at `~/.local/state/p-cast/p-cast.log`
 
 ## Optional: keep PipeWire from re‑connecting to another device
 
