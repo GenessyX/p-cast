@@ -318,6 +318,8 @@ class SinkInputMonitor:
             try:
                 sink = await controller.get_sink()
                 mapping[sink.index] = sink_name  # pyright: ignore[reportAttributeAccessIssue]
+            except SinkError:
+                pass  # available=True but init() not yet complete; next refresh will pick it up
             except Exception:
                 logger.warning("Failed to get sink for %s", sink_name, exc_info=True)
         self._sink_indices = mapping
