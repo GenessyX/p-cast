@@ -1,9 +1,13 @@
 from p_cast.config import StreamConfig
 
+# note, the ffmpeg executable is required, and it must support the pulse input format (--enable).
+# check with `ffmpeg -formats | grep pulse`.
+
 
 def create_ffmpeg_stream_command(
     sink: str,
     stream_dir: str,
+    sample_rate: int | None = None,
     config: StreamConfig | None = None,
 ) -> list[str]:
     if config is None:
@@ -12,13 +16,22 @@ def create_ffmpeg_stream_command(
     acodec = []
     if config.acodec == "aac":
         acodec = ["-c:a", "aac", "-profile:a", "aac_low"]
+
+    # resampling is OPTIONAL
+    resample = ["-ar", str(sample_rate)] if sample_rate is not None else []
+
     return [
-        "ffmpeg",
+        config.ffmpeg_bin,
         "-y",
         "-loglevel",
-        "quiet",
+        "error",
         "-f",
         "pulse",
+        # Buffer ~340ms of input audio (16 x ~21ms AAC frames at 48 kHz) so that brief
+        # PipeWire stalls don't stall the encoder and starve the HLS segment output.
+        # This is an input-side queue and has no effect on output latency.
+        "-thread_queue_size",
+        "16",
         "-i",
         sink,
         ## BLACK SQUARE --
@@ -59,10 +72,9 @@ def create_ffmpeg_stream_command(
         *acodec,
         "-b:a",
         config.bitrate,
-        "-ar",
-        str(config.sampling_frequency),
+        *resample,
         "-fflags",
-        "nobuffer",
+        "+nobuffer+discardcorrupt",
         "-flags",
         "low_delay",
         "-flush_packets",
@@ -75,8 +87,6 @@ def create_ffmpeg_stream_command(
         "experimental",
         "-avioflags",
         "direct",
-        "-fflags",
-        "discardcorrupt",
         "-probesize",
         "32",
         "-analyzeduration",

@@ -1,7 +1,7 @@
 [project]
 name = "p-cast"
-version = "1.1.0"
-description = "Cast audio from pipewire to chromecast device."
+version = "2.0.0"
+description = "Cast audio from PipeWire to chromecast devices."
 readme = "README.md"
 classifiers = [
   "Development Status :: 4 - Beta",
@@ -18,8 +18,10 @@ classifiers = [
 requires-python = ">=3.12"
 dependencies = [
   "granian>=2.2.5",
+  "pre-commit>=4.5.1",
   "pulsectl-asyncio>=1.2.2",
   "pychromecast>=14.0.7",
+  "ruff>=0.15.2",
   "socketify>=0.0.31",
   "starlette>=0.46.2",
   "typed-ffmpeg>=2.7.3",
@@ -76,6 +78,9 @@ ignore = [
   "INP001",
   "UP037",
   "PERF401",
+  "COM812",  # conflicts with formatter
+  "BLE001",  # broad exception catches are intentional for resilience with external libs
+  "PLR0913", # failing on __init__ with only 3 args, impossible to surpress due to auto-formatting
 ]
 fixable = ["ALL"]
 unfixable = []

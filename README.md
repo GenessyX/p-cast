@@ -2,58 +2,69 @@
 
 **Cast anything you can hear on your Linux desktop to any Chromecast‑compatible speaker, TV or Nest device — live, with \~3 s latency.**
 
-P‑Cast captures audio directly from PipeWire / PulseAudio, encodes it with FFmpeg and exposes the result as an HLS live stream that is played by Chromecast.
-
-Casts local audio-device to chromecast compatible device.
+P‑Cast captures audio directly from PipeWire / PulseAudio, encodes it as AAC with FFmpeg and exposes the result as an HLS live stream that is played by Chromecast. This is a full, modern `pulseaudio-dlna` replacement for PipeWire with Chromecast devices (but not DLNA-only devices)
 
 ## Quick start
 
-- Using uvx:
+Install p-cast with [uv](https://docs.astral.sh/uv/getting-started/installation/), and run it as needed, or at startup:
 
-```
-uvx p-cast
-```
+    ```bash
+    uv tool install p-cast  # once to install
+    p-cast                  # when you want to use it (see optional arguments below)
+    ```
 
-- Using pipx:
+**THEN** while running, under system Sound Settings, simply choose the Chromecast device of your choice (set it as default sink or route an app explicitly). Audio will be cast to your device.
 
-```
-pipx run p-cast
-```
+Note: Ensure that the chosen port (3000 by default) is open for incoming connections from your Chromecasts.
 
-- Using source code:
+### Alternatively:
 
-```bash
-git clone https://github.com/GenessyX/p-cast
-cd p-cast
+- Run once to test (ephemeral install):
+    - Using `uvx`: `uvx p-cast`
+    - Using `pipx`:  `pipx run p-cast`
 
-uv run python run.py
-```
+- Run from source code using `uv`:
 
-Send audio to **P‑Cast** (set it as default sink or route an app explicitly).
+    ```bash
+    git clone https://github.com/GenessyX/p-cast
+    cd p-cast
+
+    uv run python p_cast
+    ```
+
+- Run from source code using `pip`:
+
+    ```bash
+    git clone https://github.com/GenessyX/p-cast
+    cd p-cast
+
+    python3 -m venv .venv
+    source .venv/bin/activate
+    pip install .
+    python p_cast
+    ```
 
 ## Features
 
-* **Virtual sink** - creates virtual null sink P-Cast on the fly.
-* **Automatic device discovery** – finds the first Chromecast on your LAN via mDNS.
-* **On‑the‑fly transcoding** – AAC @ 256 kbps by default (customisable via env vars).
-* **Live HLS** – 0.5 s segments; Chromecast buffers 3 -> \~3 s end‑to‑end delay.
-* **Volume follow** – changes to the PipeWire sink volume are mirrored to the Chromecast.
+* **Automatic device discovery** – finds all Chromecast devices and speaker groups on your LAN via mDNS.
+* **Virtual sinks** - creates a sink for each Chromecast device or group
+* **On‑the‑fly transcoding** – AAC @ 256 kbps by default (this is the best available codec; bit rate customizable)
+* **Live HLS** – 0.5 s segments; Chromecast buffers 6 -> \~3 s end‑to‑end delay.
+* **Volume follow** – changes between the PipeWire sink volume Chromecast volume are synced.
 * **Tiny footprint** – single Python process + FFmpeg child; no browser or GUI required.
-* **Optional reconnection guard** – a `p-cast-stream.conf` snippet keeps the capture stream pinned to the chosen device.
 
-## How it works (TL;DR)
+## Command line arguments:
 
-1. `run.py` starts [Granian](https://github.com/emmett-framework/granian) and serves the Starlette app on **:3000**.
-2. `app.py`
-
-   1. discovers a Chromecast (`cast.find_chromecast`),
-   2. creates a **null sink** named `P‑Cast` (`device.SinkController`),
-   3. launches FFmpeg (`ffmpeg.create_ffmpeg_stream_command`) to read from `P‑Cast.monitor` and write HLS segments to a temp dir,
-   4. mounts that dir at **/stream**.
-3. After 2 s the Chromecast receives `http://<host>:3000/stream/index.m3u8` via the Media Controller and starts buffering.
-4. A background task listens for `pactl` volume‑change events and calls `Chromecast.set_volume(...)`.
-
-Everything runs in a single Python process; FFmpeg is the only external binary.
+    options:
+        -h, --help             show help message and exit
+        -b, --bitrate BITRATE  audio bitrate (default: 256k)
+        -p, --port PORT        streaming server tcp port (default: 3000)
+        --ffmpeg FFMPEG        path to ffmpeg binary supporting 'pulse' format (default: ffmpeg)
+        --log-file             write logs to this filename instead of to the console
+        --log-level {DEBUG,INFO,WARNING,ERROR}
+                               logging level (default: INFO)
+        --daemonize            detach from terminal and run as a background daemon (requires --log-file)
+        --pid-file PATH        write PID to this file on startup
 
 ## Requirements
 
@@ -61,14 +72,36 @@ Everything runs in a single Python process; FFmpeg is the only external binary.
 | ----------------- | --------------------------- |
 | Linux w/ PipeWire | audio capture               |
 | Python ≥ 3.12     | application runtime         |
-| FFmpeg ≥ 6.1      | encoding & HLS muxing       |
+| FFmpeg ≥ 6.1 w/ pulse support | encoding & HLS muxing  |
 | Chromecast        | playback device on same LAN |
 
-Dependencies are declared in **pyproject.toml**. The examples below use [**uv**](https://github.com/astral-sh/uv) but regular `pip` works just as well.
+Dependencies are declared in **pyproject.toml**. We prefer [**uv**](https://github.com/astral-sh/uv) but regular `pip` works just as well.
 
-```sh
-uv run python run.py
+Your **firewall** must not block your Chromecast from reaching your chosen local TCP port, or mDNS discovery (5353/UDP).
+
+## Run as a systemd service
+
+After installing p-cast, it can be set up as a as a user service using systemd.
+
+Install and enable the [service](p-cast.service) to run at boot:
+
+```bash
+# Adjust ExecStart path if p-cast isn't at ~/.local/bin/p-cast
+# Add any additional arguments to ExectStart as desired
+cp p-cast.service ~/.config/systemd/user/
+systemctl --user daemon-reload
+
+# Enable service running at startup
+systemctl --user enable --now p-cast
 ```
+
+Start / Stop / check Status (*choose one!*):
+
+```bash
+systemctl --user [start|stop|status] p-cast
+```
+
+Check logs at `~/.local/state/p-cast/p-cast.log`
 
 ## Optional: keep PipeWire from re‑connecting to another device
 
@@ -88,6 +121,26 @@ node.dont-reconnect = true        # stay on the chosen device
 node.latency        = "64/48000"  # optional, lowers internal latency
 ```
 
+## Optional: prevent desktop notifications or other sounds from being cast
+
+Use `pavucontrol` or another advanced volume controller to choose Playback to your Chromecast device only from your desired sound source (eg, the music/video player), while leaving something else as the default output device.
+
+## How it works (TL;DR)
+
+1. main app starts [Granian](https://github.com/emmett-framework/granian) and serves the Starlette app on default port **:3000**.
+2. `app.py`
+   1. discovers a Chromecast (`cast.find_chromecast`),
+   2. creates a **null sink** named `P‑Cast` (`device.SinkController`),
+   3. launches FFmpeg (`ffmpeg.create_ffmpeg_stream_command`) to read from `P‑Cast.monitor` and write HLS segments to a temp dir,
+   4. mounts that dir at **/stream**.
+3. After ~3 s the Chromecast receives `http://<host>:<port>/stream/index.m3u8` via the Media Controller and starts buffering. (port defaults to 3000)
+4. There is monitoring for device lifetime, health, disconnects, buffering, and volume changes on both sides
+
+Everything runs in a single Python process; FFmpeg is the only external binary. The program remains in foreground but can be put in the background using `--daemonize` (just putting it in the background will not work).
+
+![[p-cast Signal flow diagram]](p-cast-signal-flow.png)
+
+
 ## 🔊 Audio Delay: PipeWire to Chromecast
 
 The **minimum practical delay** between audio captured from a PipeWire sink and audio output on a Chromecast device is approximately **3 seconds**.
@@ -106,23 +159,14 @@ This delay is primarily due to how Chromecast handles **HLS streaming**, which i
 
    In practice, **Chromecast cannot reliably handle `#EXT-X-TARGETDURATION` values below 1 second**. Attempting to use smaller values (e.g., 0.25s) may result in playback stop.
 
-4. **Comparison with VLC**: Media players like **VLC** can handle much shorter segment durations (e.g., 0.25s) and respond to playlist updates more aggressively, leading to **lower latency** compared to Chromecast.
-
----
-
-### 💡 Summary
-
-| Player       | Minimum stable segment duration | Behavior                       |
-| ------------ | ------------------------------- | ------------------------------ |
-| Chromecast   | \~1 second                      | Buffers 3 segments, \~3s delay |
-| VLC / hls.js | 0.25–0.5 seconds                | Can start playback much faster |
+4. **Comparison with VLC**: Local media players like **VLC** can handle much shorter segment durations (e.g., 0.25s) and respond to playlist updates more aggressively, leading to **lower latency** compared to Chromecast.
 
 ## Known limitations
 
-* Only the **first** Chromecast discovered is used. Open a PR to add a selector!
-* Audio only. Support for dummy video tracks is stub‑bed out in `ffmpeg.py`.
-* Tested on **Manjaro Linux** / **PipeWire 1.4.1**;
-* 3+ seconds delay.
+* Audio only. Support for dummy video tracks is stubbed out in `ffmpeg.py`.
+* Tested on **Manjaro Linux** / **PipeWire 1.4.1** and ***Linux Mint 22.3 (ubuntu 24.04) *** / ***PipeWire 1.0.5***
+* ~3 seconds delay (this is essentially a chromecast limitation)
+* Only one chromecast may be streamed to at a time. You can make use of Google Home to create Speaker Groups for synced playback to multiple chromecasts (each group will become a selectable audio sink)
 
 ## Roadmap
 
@@ -130,16 +174,15 @@ This delay is primarily due to how Chromecast handles **HLS streaming**, which i
    | Variable            | Default  | Description                     |
    | ------------------- | -------- | ------------------------------- |
    | `PCAST_BITRATE`     | `256k`   | AAC bitrate fed to FFmpeg       |
-   | `PCAST_SAMPLE_RATE` | `48000`  | Sampling rate (Hz)              |
-   | `PCAST_HLS_FORMAT`  | `mpegts` | `mpegts` or experimental `fmp4` |
-   | `PCAST_SINK_NAME`   | `P-Cast` | Name of the null sink           |
+   | `PCAST_SAMPLE_RATE` | `48000`  | Override Sampling rate (Hz)     |
+   | `PCAST_PORT`        | `3000`   | Port used for streaming to chromecast |
 
-   See `config.py` for details.
+    * currently environment variables are used internally but not exposed to the user (you can use the command line however)
 
-* Multiple chromecast devices support.
-* Package with `uvx` (`uv tool`).
 * Enhance repository structure.
+* Show currently playing media on chromecast (title/artist/album cover)
 * Qt tray app to control chromecast device (pause/play).
+* When switching between our own chromecast sinks, retain the ffmpeg/http components rather than stopping and re-creating, if possible
 
 ## Contributing
 

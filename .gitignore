@@ -11,3 +11,6 @@ wheels/
 .mypy_cache/
 
 requirements.txt
+
+*.pid
+*.log
