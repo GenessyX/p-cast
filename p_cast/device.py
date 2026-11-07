@@ -24,6 +24,8 @@ type DeactivationCallback = Callable[[str], Coroutine[None, None, None]]
 _SINK_NAME_INVALID_CHARS = re.compile(r"[^a-zA-Z0-9_-]")
 
 _MIN_AUDIBLE_VOLUME = 0.1
+# Less than a single volume-up/down step; also absorbs PulseAudio's volume quantization.
+_VOLUME_EPSILON = 0.005
 
 
 def _make_sink_name(chromecast_name: str) -> str:
@@ -99,6 +101,8 @@ class SinkController:
     async def start_volume_sync(self) -> None:
         self._synced_volume: float | None = None
         self._synced_mute: bool | None = None
+        # Number of our own set_volume/set_volume_muted calls waiting for the device.
+        self._cast_requests_in_flight = 0
         self._volume_listener = asyncio.create_task(self._subscribe_volume())
         self._volume_listener.add_done_callback(self._on_volume_listener_done)
         loop = asyncio.get_running_loop()
@@ -214,9 +218,12 @@ class SinkController:
 
         Skips the update if the values are already in sync (e.g. an echo of our
         own set_volume call), preventing feedback loops with _subscribe_volume.
+        Statuses received while our own request is in flight are replies to it
+        (possibly to an older one), not user changes on the device: ignore them.
         """
-        volume_epsilon = 0.005  # less than a single volume-up/down step
-        level_changed = self._synced_volume is None or abs(level - self._synced_volume) > volume_epsilon
+        if self._cast_requests_in_flight:
+            return
+        level_changed = self._synced_volume is None or abs(level - self._synced_volume) > _VOLUME_EPSILON
         mute_changed = self._synced_mute is None or muted != self._synced_mute
         if not level_changed and not mute_changed:
             return
@@ -268,15 +275,24 @@ class SinkController:
             changed_mute = self.get_mute(changed_sink)
             # pychromecast waits for the device's reply (up to its request timeout);
             # run it off the event loop, which also serves the HLS segments.
+            # Update the synced state before awaiting, so a cast status received in the
+            # meantime is not mistaken for a change made on the device.
+            volume_changed = self._synced_volume is None or abs(changed_volume - self._synced_volume) > _VOLUME_EPSILON
+            mute_changed = changed_mute != self._synced_mute
+            if not volume_changed and not mute_changed:
+                continue
+            self._cast_requests_in_flight += 1
             try:
-                if changed_volume != self._synced_volume:
-                    await asyncio.to_thread(self.cast.set_volume, volume=changed_volume)
+                if volume_changed:
                     self._synced_volume = changed_volume
-                if changed_mute != self._synced_mute:
-                    await asyncio.to_thread(self.cast.set_volume_muted, muted=changed_mute)
+                    await asyncio.to_thread(self.cast.set_volume, volume=changed_volume)
+                if mute_changed:
                     self._synced_mute = changed_mute
+                    await asyncio.to_thread(self.cast.set_volume_muted, muted=changed_mute)
             except Exception:
                 logger.warning("Failed to sync volume to Chromecast", exc_info=True)
+            finally:
+                self._cast_requests_in_flight -= 1
 
 
 class SinkInputMonitor:
