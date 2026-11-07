@@ -30,7 +30,7 @@ from starlette.routing import Route
 from starlette.staticfiles import StaticFiles
 
 from p_cast.cast import CastDiscovery, get_local_ip, subscribe_to_stream
-from p_cast.config import MAX_SAMPLE_RATE, StreamConfig
+from p_cast.config import DEFAULT_SINK_GAIN, MAX_SAMPLE_RATE, StreamConfig
 from p_cast.device import SinkController, SinkInputMonitor
 from p_cast.ffmpeg import create_ffmpeg_stream_command
 
@@ -262,6 +262,7 @@ async def lifespan(  # noqa: C901, PLR0915
     stream_config: StreamConfig,
     discovery: CastDiscovery,
     streaming_port: int,
+    sink_gain: float = DEFAULT_SINK_GAIN,
 ) -> AsyncIterator[None]:
     for controller in controllers.values():
         await controller.init()
@@ -537,7 +538,7 @@ async def lifespan(  # noqa: C901, PLR0915
             return
 
         if not controller:
-            controller = SinkController(chromecast=chromecast)
+            controller = SinkController(chromecast=chromecast, sink_gain=sink_gain)
             await controller.init()
             controllers[controller.sink_name] = controller
             logger.info("Device added: %s", controller.sink_name)
@@ -668,6 +669,7 @@ def create_app() -> Starlette:
     chromecasts = discovery.discover()
 
     streaming_port = int(os.environ["PCAST_PORT"])
+    sink_gain = float(os.environ.get("PCAST_SINK_GAIN", DEFAULT_SINK_GAIN))
     stream_config = StreamConfig(
         acodec="aac",
         bitrate=os.environ["PCAST_BITRATE"],
@@ -678,6 +680,7 @@ def create_app() -> Starlette:
     for chromecast in chromecasts:
         controller = SinkController(
             chromecast=chromecast,
+            sink_gain=sink_gain,
         )
         controllers[controller.sink_name] = controller
 
@@ -708,6 +711,7 @@ def create_app() -> Starlette:
             stream_config=stream_config,
             discovery=discovery,
             streaming_port=streaming_port,
+            sink_gain=sink_gain,
         ),
         middleware=middleware,
     )
