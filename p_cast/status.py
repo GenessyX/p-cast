@@ -221,9 +221,19 @@ class StatusTracker:
 
     # -- events ----------------------------------------------------------------
 
-    def event(self, level: str, code: str, text: str, sink_name: str | None = None) -> None:
-        """Record something a user may want to know (``level``: info, warning, error)."""
-        entry = {"ts": time.time(), "level": level, "code": code, "sink_name": sink_name, "text": text}
+    def event(self, level: str, code: str, text: str, sink_name: str | None = None, **args: object) -> None:
+        """Record something a user may want to know (``level``: info, warning, error).
+
+        ``text`` is an English description; ``code`` and ``args`` let a UI show its own.
+        """
+        entry = {
+            "ts": time.time(),
+            "level": level,
+            "code": code,
+            "sink_name": sink_name,
+            "text": text,
+            "args": {k: v if isinstance(v, (int, float, str, type(None))) else str(v) for k, v in args.items()},
+        }
         self._events.append(entry)
         self._broadcast(json.dumps({"type": "event", "event": entry}))
 

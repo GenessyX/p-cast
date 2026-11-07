@@ -222,6 +222,7 @@ class BufferingWatchdog(MediaStatusListener):
                 "load_failed",
                 f"Chromecast failed to load the stream (error {error_code})",
                 self._sink_name,
+                error=error_code,
             ),
         )
 
@@ -257,6 +258,7 @@ class BufferingWatchdog(MediaStatusListener):
             "buffering_restart",
             f"Buffering for {_BUFFERING_RECOVER_TIMEOUT}s, restarting the stream",
             self._sink_name,
+            seconds=_BUFFERING_RECOVER_TIMEOUT,
         )
         await self._on_recover(self._sink_name)
 
@@ -327,7 +329,7 @@ async def lifespan(  # noqa: C901, PLR0915
         await controller.init()
         tracker.add_device(controller.sink_name, controller.cast.name)
     tracker.port = streaming_port
-    tracker.event("info", "started", f"p-cast started, {len(controllers)} device(s) found")
+    tracker.event("info", "started", f"p-cast started, {len(controllers)} device(s) found", count=len(controllers))
 
     active_stream: ActiveStream | None = None
     local_ip = None  # defer initialization until we have devices (and thus a network up)
@@ -402,7 +404,11 @@ async def lifespan(  # noqa: C901, PLR0915
             )
             tracker.set_phase(sink_name, "unavailable", reason="not reachable")
             tracker.event(
-                "error", "not_reachable", f"Chromecast not reachable within {CAST_CONNECT_TIMEOUT}s", sink_name
+                "error",
+                "not_reachable",
+                f"Chromecast not reachable within {CAST_CONNECT_TIMEOUT}s",
+                sink_name,
+                seconds=CAST_CONNECT_TIMEOUT,
             )
             controller.available = False
             with contextlib.suppress(TimeoutError):
@@ -487,6 +493,7 @@ async def lifespan(  # noqa: C901, PLR0915
                             "quitting_app",
                             f"Closing {cast.app_display_name or cast.app_id} on the Chromecast",
                             sink_name,
+                            app=cast.app_display_name or cast.app_id,
                         )
                         await asyncio.to_thread(cast.quit_app)
                         tracker.set_phase(sink_name, "quitting_app", timeout=_APP_QUIT_DELAY)
@@ -497,7 +504,9 @@ async def lifespan(  # noqa: C901, PLR0915
                     tracker.event("info", "loading", "Stream sent to the Chromecast", sink_name)
                 except Exception as exc:
                     logger.exception("Failed to subscribe Chromecast to stream")
-                    tracker.event("error", "subscribe_failed", f"Could not start the stream: {exc}", sink_name)
+                    tracker.event(
+                        "error", "subscribe_failed", f"Could not start the stream: {exc}", sink_name, error=exc
+                    )
 
             subscribe_task = asyncio.create_task(subscribe())
             tracker.set_phase(sink_name, "subscribing", timeout=_STREAM_SUBSCRIBE_DELAY)
@@ -521,7 +530,13 @@ async def lifespan(  # noqa: C901, PLR0915
                     return
                 logger.error("FFmpeg exited unexpectedly (code %d) for %s, restarting stream", returncode, sink_name)
                 tracker.set_phase(sink_name, "restarting", timeout=_FFMPEG_RESTART_DELAY, reason="encoder exited")
-                tracker.event("error", "ffmpeg_exited", f"Encoder stopped (code {returncode}), restarting", sink_name)
+                tracker.event(
+                    "error",
+                    "ffmpeg_exited",
+                    f"Encoder stopped (code {returncode}), restarting",
+                    sink_name,
+                    exit_code=returncode,
+                )
                 await asyncio.sleep(_FFMPEG_RESTART_DELAY)
                 if _shutting_down:
                     return
@@ -625,7 +640,7 @@ async def lifespan(  # noqa: C901, PLR0915
         await monitor.refresh_sink_indices()
         logger.info("Device no longer available: %s (%s)", sink_name, controller.device_id)
         tracker.set_phase(sink_name, "unavailable", reason=reason)
-        tracker.event("warning", "unavailable", f"Device no longer available ({reason})", sink_name)
+        tracker.event("warning", "unavailable", f"Device no longer available ({reason})", sink_name, reason=reason)
 
     def get_controller(device_id: UUID) -> SinkController | None:
         for controller in controllers.values():

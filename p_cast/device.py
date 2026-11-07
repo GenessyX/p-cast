@@ -447,13 +447,16 @@ class SinkInputMonitor:
                             "switching",
                             f"Audio moved to {sink_name}, stopping {self._active_sink}",
                             sink_name,
+                            previous=self._active_sink,
                         )
                         await self._on_deactivate(self._active_sink)
                     self._active_sink = sink_name
                     self._active_sink_inputs.clear()
                     logger.info("Sink activated: %s", sink_name)
                     tracker.set_source(_app_name(si))
-                    tracker.event("info", "activated", f"Audio from {_app_name(si) or 'an app'}", sink_name)
+                    tracker.event(
+                        "info", "activated", f"Audio from {_app_name(si) or 'an app'}", sink_name, app=_app_name(si)
+                    )
                     await self._on_activate(sink_name)
                 # A failed activation calls clear_active(); don't track the input then,
                 # so the next event for it retries the activation.
@@ -489,7 +492,7 @@ class SinkInputMonitor:
             return
         if not self._active_sink_inputs and self._active_sink == sink_name:
             logger.info("Sink deactivated (after grace period): %s", sink_name)
-            tracker.event("info", "idle_stop", f"No audio for {delay_s:.0f}s", sink_name)
+            tracker.event("info", "idle_stop", f"No audio for {delay_s:.0f}s", sink_name, seconds=delay_s)
             await self._on_deactivate(sink_name)
             self._active_sink = None
         self._deactivation_task = None
