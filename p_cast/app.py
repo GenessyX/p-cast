@@ -298,6 +298,9 @@ async def lifespan(  # noqa: C901, PLR0915
         controller = controllers[sink_name]
         if not controller.available:
             logger.warning("Skipping activation for unavailable device: %s", sink_name)
+            # Let the monitor retry on the next sink-input event instead of
+            # believing this sink is streaming.
+            monitor.clear_active()
             return
 
         if not local_ip:
@@ -432,6 +435,7 @@ async def lifespan(  # noqa: C901, PLR0915
 
         except Exception:
             logger.exception("Failed to activate stream for sink: %s", sink_name)
+            monitor.clear_active()
             if subscribe_task is not None:
                 subscribe_task.cancel()
             if ffmpeg_process is not None and ffmpeg_process.returncode is None:

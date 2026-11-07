@@ -395,7 +395,10 @@ class SinkInputMonitor:
                     self._active_sink_inputs.clear()
                     logger.info("Sink activated: %s", sink_name)
                     await self._on_activate(sink_name)
-                self._active_sink_inputs.add(sink_input_index)
+                # A failed activation calls clear_active(); don't track the input then,
+                # so the next event for it retries the activation.
+                if self._active_sink == sink_name:
+                    self._active_sink_inputs.add(sink_input_index)
             elif sink_input_index in self._active_sink_inputs:
                 # Sink-input moved away from our sink to a non-monitored sink
                 self._active_sink_inputs.discard(sink_input_index)
