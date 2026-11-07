@@ -11,6 +11,7 @@ from functools import partial
 from typing import override
 from uuid import UUID
 
+from pychromecast import Chromecast
 from pychromecast.config import APP_BACKDROP, APP_MEDIA_RECEIVER
 from pychromecast.controllers.media import MediaStatus, MediaStatusListener
 from pychromecast.error import RequestTimeout
@@ -518,6 +519,14 @@ async def lifespan(  # noqa: C901, PLR0915
         current_address = (controller.cast.cast_info.host, controller.cast.cast_info.port)
         return new_address == current_address
 
+    async def handle_address_change(controller: SinkController, chromecast: Chromecast) -> None:
+        """Point an available controller at the device's new address without removing its sink."""
+        if active_stream is not None and monitor.active_sink == controller.sink_name:
+            # on_activate disconnects the old cast and connects to the new address
+            await restart_stream(controller.sink_name)
+        else:
+            controller.cast = chromecast
+
     _handling_devices: set[UUID] = set()
 
     async def handle_device_add(device_id: UUID) -> None:
@@ -531,21 +540,24 @@ async def lifespan(  # noqa: C901, PLR0915
         finally:
             _handling_devices.discard(device_id)
 
-    async def _handle_device_add(device_id: UUID) -> None:
+    async def _handle_device_add(device_id: UUID) -> None:  # noqa: C901
         """React to mDNS add_service or update_service events to recover previously unavailable devices,
         mark newly unreachable devices unavailable, and handle potential IP changes."""
         controller = get_controller(device_id)
+        address_changed = False
         if controller:
             new_address = discovery.get_device_address(device_id)
             if new_address is None:
                 return
             if controller.available and not address_matches(controller, new_address):
+                # Common for speaker groups: the group leader (and with it the address)
+                # moves between members. Keep the sink so audio routed to it stays put.
                 logger.info(
-                    "Device %s address changed to: %s:%d, re-adding",
+                    "Device %s address changed to: %s:%d, reconnecting",
                     controller.sink_name,
                     *new_address,
                 )
-                await mark_device_unavailable(controller.sink_name, controller)
+                address_changed = True
             elif not controller.available and not await _tcp_probe(*new_address):
                 # Cheap pre-filter: skip expensive wait() if TCP is dead
                 logger.debug("TCP probe failed for %s at %s:%d", controller.sink_name, *new_address)
@@ -590,6 +602,8 @@ async def lifespan(  # noqa: C901, PLR0915
             controller.available = True
             await controller.init()
             logger.info("Device restored: %s", controller.sink_name)
+        elif address_changed:
+            await handle_address_change(controller, chromecast)
         await monitor.refresh_sink_indices()
 
     async def handle_device_remove(device_id: UUID) -> None:
