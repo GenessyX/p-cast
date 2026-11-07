@@ -218,9 +218,9 @@ class SinkController:
             cast_volume = self.cast.status.volume_level  # type: ignore[union-attr]
             cast_mute = self.cast.status.volume_muted  # type: ignore[union-attr]
             if cast_mute:
-                self.cast.set_volume_muted(muted=False)
+                await asyncio.to_thread(self.cast.set_volume_muted, muted=False)
             if cast_volume is not None and cast_volume < _MIN_AUDIBLE_VOLUME:
-                self.cast.set_volume(_MIN_AUDIBLE_VOLUME)
+                await asyncio.to_thread(self.cast.set_volume, _MIN_AUDIBLE_VOLUME)
                 cast_volume = _MIN_AUDIBLE_VOLUME
             if cast_volume is not None:
                 await self._pulse.volume_set_all_chans(sink, cast_volume)
@@ -243,12 +243,14 @@ class SinkController:
             changed_sink = await self.get_sink()
             changed_volume = self.get_volume(changed_sink)
             changed_mute = self.get_mute(changed_sink)
+            # pychromecast waits for the device's reply (up to its request timeout);
+            # run it off the event loop, which also serves the HLS segments.
             try:
                 if changed_volume != self._synced_volume:
-                    self.cast.set_volume(volume=changed_volume)
+                    await asyncio.to_thread(self.cast.set_volume, volume=changed_volume)
                     self._synced_volume = changed_volume
                 if changed_mute != self._synced_mute:
-                    self.cast.set_volume_muted(muted=changed_mute)
+                    await asyncio.to_thread(self.cast.set_volume_muted, muted=changed_mute)
                     self._synced_mute = changed_mute
             except Exception:
                 logger.warning("Failed to sync volume to Chromecast", exc_info=True)

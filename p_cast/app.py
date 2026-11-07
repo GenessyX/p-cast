@@ -244,7 +244,7 @@ class ActiveStream:
         self.subscribe_task.cancel()
         with contextlib.suppress(Exception):
             # tell it to stop, but don't quit() the CC app (and trigger a disconnect)
-            self.volume_controller.cast.media_controller.stop(timeout=1.0)
+            await asyncio.to_thread(self.volume_controller.cast.media_controller.stop, timeout=1.0)
         if self.ffmpeg_process.returncode is None:
             self.ffmpeg_process.terminate()
             await self.ffmpeg_process.wait()
@@ -617,7 +617,7 @@ async def pause(request: Request) -> Response:
     media_controller = _get_active_media_controller(request)
     if media_controller is None:
         return Response(content="No active device", status_code=404)
-    media_controller.pause()
+    await asyncio.to_thread(media_controller.pause)
     return Response(content="OK")
 
 
@@ -625,8 +625,8 @@ async def play(request: Request) -> Response:
     media_controller = _get_active_media_controller(request)
     if media_controller is None:
         return Response(content="No active device", status_code=404)
-    media_controller.play()
-    media_controller.seek(None)  # pyright: ignore[reportArgumentType]
+    await asyncio.to_thread(media_controller.play)
+    await asyncio.to_thread(media_controller.seek, None)  # pyright: ignore[reportArgumentType]
     return Response(content="OK")
 
 
