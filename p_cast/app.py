@@ -236,14 +236,14 @@ class BufferingWatchdog(MediaStatusListener):
         """Schedule recovery if not already pending. Called on event loop."""
         if self._timer_task is None or self._timer_task.done():
             self._timer_task = asyncio.create_task(self._recover_after_timeout())
-            logger.info("Buffering watchdog: starting recovery timer for %s", self._sink_name)
+            logger.debug("Buffering watchdog: starting recovery timer for %s", self._sink_name)
 
     def _cancel_timer(self) -> None:
         """Cancel a pending recovery timer. Called on event loop."""
         if self._timer_task is not None:
             self._timer_task.cancel()
             self._timer_task = None
-            logger.info("Buffering watchdog: cancelling recovery timer for %s", self._sink_name)
+            logger.debug("Buffering watchdog: cancelling recovery timer for %s", self._sink_name)
 
     async def _recover_after_timeout(self) -> None:
         try:

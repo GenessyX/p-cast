@@ -35,6 +35,9 @@ __all__ = ["StatusTracker", "status"]
 _EVENT_LOG_SIZE = 50
 _BUFFERING_WINDOW = 60.0  # seconds counted by "buffering_last_minute"
 _SUBSCRIBER_QUEUE_SIZE = 100
+# A Chromecast playing at the live edge reports BUFFERING for a fraction of a second between
+# segments while the audio keeps playing. Only BUFFERING that lasts longer is shown.
+_BUFFERING_GRACE = 2.0
 _STREAMING_PHASES = frozenset(
     {
         "connecting",
@@ -62,6 +65,7 @@ class _Device:
     reason: str | None = None
     player_state: str | None = None
     check_deadline: float | None = None
+    buffering_timer: asyncio.TimerHandle | None = None
     buffering_at: deque[float] = field(default_factory=lambda: deque(maxlen=100))
 
     def to_dict(self, sink_name: str, now: float) -> dict[str, Any]:
@@ -129,6 +133,9 @@ class StatusTracker:
             device.buffering_at.append(now)
         if phase in {"ready", "unavailable"}:
             device.player_state = None
+            if device.buffering_timer is not None:
+                device.buffering_timer.cancel()
+                device.buffering_timer = None
             if self.active_sink == sink_name:
                 self._set_active(None)
         elif phase == "connecting":
@@ -148,6 +155,34 @@ class StatusTracker:
         if device is None or device.player_state == state:
             return
         device.player_state = state
+        if device.buffering_timer is not None:
+            device.buffering_timer.cancel()
+            device.buffering_timer = None
+        if state == "BUFFERING" and device.phase not in {"buffering", "loading"}:
+            # Wait: most BUFFERING reports end before the grace period does.
+            try:
+                loop = asyncio.get_running_loop()
+            except RuntimeError:
+                pass
+            else:
+                device.buffering_timer = loop.call_later(
+                    _BUFFERING_GRACE,
+                    self._buffering_confirmed,
+                    sink_name,
+                    max(buffering_timeout - _BUFFERING_GRACE, 0),
+                )
+                return
+        self._apply_player_state(sink_name, device, state, buffering_timeout)
+
+    def _buffering_confirmed(self, sink_name: str, buffering_timeout: float) -> None:
+        device = self._devices.get(sink_name)
+        if device is None:
+            return
+        device.buffering_timer = None
+        if device.player_state == "BUFFERING":
+            self._apply_player_state(sink_name, device, "BUFFERING", buffering_timeout)
+
+    def _apply_player_state(self, sink_name: str, device: _Device, state: str, buffering_timeout: float) -> None:
         phase = _PLAYER_PHASES.get(state)
         if (
             phase is None
