@@ -1,5 +1,6 @@
 import asyncio
 import contextlib
+import ipaddress
 import logging
 import os
 import signal
@@ -56,6 +57,21 @@ _FFMPEG_STARTUP_DELAY = 0.5
 _STREAM_SUBSCRIBE_DELAY = 2
 _APP_QUIT_DELAY = 1.0
 _BUFFERING_RECOVER_TIMEOUT = 6  # seconds of sustained BUFFERING before restarting stream (6 is minimum)
+
+
+def _normalize_host(host: str) -> str:
+    """Return a canonical form of an IP address so that equal addresses compare equal.
+
+    zeroconf may report the same IPv4 address as an IPv4-mapped IPv6 address
+    (e.g. ``::ffff:a0a:32b7`` for ``10.10.50.183``).
+    """
+    try:
+        ip = ipaddress.ip_address(host)
+    except ValueError:
+        return host
+    if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped is not None:
+        return str(ip.ipv4_mapped)
+    return str(ip)
 
 
 async def _tcp_probe(host: str, port: int, probe_timeout: float = 3.0) -> bool:
@@ -516,8 +532,9 @@ async def lifespan(  # noqa: C901, PLR0915
         return None
 
     def address_matches(controller: SinkController, new_address: tuple[str, int]) -> bool:
-        current_address = (controller.cast.cast_info.host, controller.cast.cast_info.port)
-        return new_address == current_address
+        current_host, current_port = controller.cast.cast_info.host, controller.cast.cast_info.port
+        new_host, new_port = new_address
+        return _normalize_host(new_host) == _normalize_host(current_host) and new_port == current_port
 
     async def handle_address_change(controller: SinkController, chromecast: Chromecast) -> None:
         """Point an available controller at the device's new address without removing its sink."""
