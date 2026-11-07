@@ -5,6 +5,8 @@ type AudioCodec = Literal["aac"]
 type HlsSegmentType = Literal["mpegts", "fmp4"]
 
 MAX_SAMPLE_RATE = 96000
+# Fixed linear gain of the virtual sinks (5.0 is about +14 dB).
+DEFAULT_SINK_GAIN = 5.0
 
 
 @dataclass
