@@ -1,6 +1,7 @@
 import asyncio
 import contextlib
 import ipaddress
+import itertools
 import logging
 import os
 import signal
@@ -61,6 +62,11 @@ _STREAM_SUBSCRIBE_DELAY = 2
 _APP_QUIT_DELAY = 1.0
 _FFMPEG_RESTART_DELAY = 2  # seconds to wait before restarting a stream whose FFmpeg exited
 _BUFFERING_RECOVER_TIMEOUT = 6  # seconds of sustained BUFFERING before restarting stream (6 is minimum)
+# Seconds between reconnection attempts to a device whose connection was lost; the last
+# value repeats. mDNS does not re-announce a device that only dropped off for a moment
+# (Wi-Fi hiccup, the PC resuming from suspend), so without retries it stays unavailable
+# until its record expires.
+_RECONNECT_DELAYS = (5, 10, 20, 30, 60)
 
 
 def _normalize_host(host: str) -> str:
@@ -351,6 +357,7 @@ async def lifespan(  # noqa: C901, PLR0915
         await controller.remove_sink()
         await monitor.refresh_sink_indices()
         monitor.clear_active()
+        schedule_reconnect(controller, "connection lost")
 
     async def _activate(sink_name: str) -> None:  # noqa: PLR0915, C901
         nonlocal active_stream
@@ -416,6 +423,7 @@ async def lifespan(  # noqa: C901, PLR0915
             await controller.remove_sink()
             await monitor.refresh_sink_indices()
             monitor.clear_active()
+            schedule_reconnect(controller, "not reachable")
             return
 
         stream_dir = tempfile.TemporaryDirectory()
@@ -728,6 +736,7 @@ async def lifespan(  # noqa: C901, PLR0915
             if controller and controller.available:
                 logger.warning("Device %s (%s) failed health check on add/update", controller.sink_name, device_id)
                 await mark_device_unavailable(controller.sink_name, controller, "health check failed")
+                schedule_reconnect(controller, "health check failed")
             else:
                 logger.debug("Device %s not yet reachable at app level", device_id)
             return
@@ -748,6 +757,31 @@ async def lifespan(  # noqa: C901, PLR0915
         elif address_changed:
             await handle_address_change(controller, chromecast)
         await monitor.refresh_sink_indices()
+
+    _reconnect_tasks: dict[UUID, asyncio.Task[None]] = {}
+
+    def schedule_reconnect(controller: SinkController, reason: str) -> None:
+        """Keep checking a device that became unreachable until it is back."""
+        task = _reconnect_tasks.get(controller.device_id)
+        if task is None or task.done():
+            _reconnect_tasks[controller.device_id] = spawn(reconnect(controller, reason))
+
+    async def reconnect(controller: SinkController, reason: str) -> None:
+        sink_name = controller.sink_name
+        try:
+            for attempt in itertools.count():
+                if controller.available or _shutting_down:
+                    return
+                delay = _RECONNECT_DELAYS[min(attempt, len(_RECONNECT_DELAYS) - 1)]
+                tracker.set_phase(sink_name, "unavailable", timeout=delay, reason=reason)
+                await asyncio.sleep(delay)
+                if controller.available or _shutting_down:
+                    return
+                logger.info("Checking if %s is reachable again (attempt %d)", sink_name, attempt + 1)
+                # The same check an mDNS update triggers: TCP probe, then a Chromecast connection.
+                await handle_device_add(controller.device_id)
+        finally:
+            _reconnect_tasks.pop(controller.device_id, None)
 
     async def handle_device_remove(device_id: UUID) -> None:
         for sink_name, controller in controllers.items():
