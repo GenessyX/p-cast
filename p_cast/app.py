@@ -63,10 +63,10 @@ def _normalize_host(host: str) -> str:
     """Return a canonical form of an IP address so that equal addresses compare equal.
 
     zeroconf may report the same IPv4 address as an IPv4-mapped IPv6 address
-    (e.g. ``::ffff:a0a:32b7`` for ``10.10.50.183``).
+    (e.g. ``::ffff:a0a:32b7`` or ``[::ffff:a0a:32b7]`` for ``10.10.50.183``).
     """
     try:
-        ip = ipaddress.ip_address(host)
+        ip = ipaddress.ip_address(host.removeprefix("[").removesuffix("]"))
     except ValueError:
         return host
     if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped is not None:
