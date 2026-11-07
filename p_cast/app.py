@@ -52,6 +52,7 @@ def _sd_notify(state: str) -> None:
 
 _FFMPEG_STARTUP_DELAY = 0.5
 _STREAM_SUBSCRIBE_DELAY = 2
+_FFMPEG_RESTART_DELAY = 2  # seconds to wait before restarting a stream whose FFmpeg exited
 _BUFFERING_RECOVER_TIMEOUT = 6  # seconds of sustained BUFFERING before restarting stream (6 is minimum)
 
 
@@ -165,7 +166,7 @@ class BufferingWatchdog(MediaStatusListener):
     def new_media_status(self, status: MediaStatus) -> None:
         if not self._active:
             return
-        if status.player_state in "BUFFERING":
+        if status.player_state == "BUFFERING":
             self._loop.call_soon_threadsafe(self._start_timer)
         else:  # PAUSED, PLAYING, IDLE, UNKNOWN
             self._loop.call_soon_threadsafe(self._cancel_timer)
@@ -226,6 +227,7 @@ class ActiveStream:
         stream_dir: tempfile.TemporaryDirectory[str],
         stream_app: StaticFilesWithCORS,
         subscribe_task: asyncio.Task[None],
+        ffmpeg_watcher: asyncio.Task[None],
         volume_controller: SinkController,
         connection_listener: CastConnectionListener,
         buffering_watchdog: BufferingWatchdog,
@@ -234,6 +236,7 @@ class ActiveStream:
         self.stream_dir = stream_dir
         self.stream_app = stream_app
         self.subscribe_task = subscribe_task
+        self.ffmpeg_watcher = ffmpeg_watcher
         self.volume_controller = volume_controller
         self.connection_listener = connection_listener
         self.buffering_watchdog = buffering_watchdog
@@ -242,6 +245,9 @@ class ActiveStream:
         self.connection_listener.deactivate()
         self.buffering_watchdog.cancel()
         self.subscribe_task.cancel()
+        # The watcher itself may be tearing the stream down (restart after FFmpeg exited).
+        if self.ffmpeg_watcher is not asyncio.current_task():
+            self.ffmpeg_watcher.cancel()
         with contextlib.suppress(Exception):
             # tell it to stop, but don't quit() the CC app (and trigger a disconnect)
             self.volume_controller.cast.media_controller.stop(timeout=1.0)
@@ -332,6 +338,7 @@ async def lifespan(  # noqa: C901, PLR0915
         stream_dir = tempfile.TemporaryDirectory()
         ffmpeg_process: asyncio.subprocess.Process | None = None
         subscribe_task: asyncio.Task[None] | None = None
+        ffmpeg_watcher: asyncio.Task[None] | None = None
 
         try:
             sink_info = await controller.get_sink()
@@ -405,11 +412,28 @@ async def lifespan(  # noqa: C901, PLR0915
             )
             cast.register_connection_listener(connection_listener)
 
+            async def watch_ffmpeg(process: asyncio.subprocess.Process) -> None:
+                # Drain stderr so FFmpeg never blocks on a full pipe, and log what it reports.
+                if process.stderr is not None:
+                    async for line in process.stderr:
+                        logger.warning("FFmpeg (%s): %s", sink_name, line.decode(errors="replace").rstrip())
+                returncode = await process.wait()
+                if _shutting_down:
+                    return
+                logger.error("FFmpeg exited unexpectedly (code %d) for %s, restarting stream", returncode, sink_name)
+                await asyncio.sleep(_FFMPEG_RESTART_DELAY)
+                if _shutting_down:
+                    return
+                await restart_stream(sink_name)
+
+            ffmpeg_watcher = asyncio.create_task(watch_ffmpeg(ffmpeg_process))
+
             active_stream = ActiveStream(
                 ffmpeg_process=ffmpeg_process,
                 stream_dir=stream_dir,
                 stream_app=stream_app,
                 subscribe_task=subscribe_task,
+                ffmpeg_watcher=ffmpeg_watcher,
                 volume_controller=controller,
                 connection_listener=connection_listener,
                 buffering_watchdog=buffering_watchdog,
@@ -421,6 +445,8 @@ async def lifespan(  # noqa: C901, PLR0915
             logger.exception("Failed to activate stream for sink: %s", sink_name)
             if subscribe_task is not None:
                 subscribe_task.cancel()
+            if ffmpeg_watcher is not None:
+                ffmpeg_watcher.cancel()
             if ffmpeg_process is not None and ffmpeg_process.returncode is None:
                 ffmpeg_process.terminate()
                 await ffmpeg_process.wait()
