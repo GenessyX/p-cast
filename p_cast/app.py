@@ -320,8 +320,14 @@ async def lifespan(  # noqa: C901, PLR0915
             monitor.clear_active()
             return
 
-        if not local_ip:
+        # Resolve on every activation: a laptop may have moved to another network
+        # (or got a new DHCP lease) since the previous one.
+        try:
             local_ip = get_local_ip()
+        except OSError:
+            if not local_ip:
+                raise
+            logger.warning("Could not determine local IP, reusing %s", local_ip)
 
         # Stop any leftover socket thread from the previous chromecast object.
         # No-op on first activation (socket thread not started until wait()).
