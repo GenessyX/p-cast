@@ -365,7 +365,8 @@ class SinkInputMonitor:
     async def refresh_sink_indices(self) -> None:
         """Re-query all controllers to rebuild the sink index mapping."""
         mapping: dict[int, str] = {}
-        for sink_name, controller in self._controllers.items():
+        # Copy: devices can be added or removed while get_sink() awaits.
+        for sink_name, controller in list(self._controllers.items()):
             if not controller.available:
                 continue
             try:
@@ -490,12 +491,17 @@ class SinkInputMonitor:
             await asyncio.sleep(delay_s)
         except asyncio.CancelledError:
             return
+        # From here on the deactivation must run to the end: a sink-input that shows up
+        # meanwhile would cancel this task halfway through the teardown (FFmpeg stopped,
+        # stream still marked active) and then never trigger an activation.
+        self._deactivation_task = None
         if not self._active_sink_inputs and self._active_sink == sink_name:
             logger.info("Sink deactivated (after grace period): %s", sink_name)
             tracker.event("info", "idle_stop", f"No audio for {delay_s:.0f}s", sink_name, seconds=delay_s)
-            await self._on_deactivate(sink_name)
+            # Clear first, so a new sink-input during the teardown activates the sink again
+            # (on_activate waits for the teardown to finish).
             self._active_sink = None
-        self._deactivation_task = None
+            await self._on_deactivate(sink_name)
 
     def clear_active(self) -> None:
         """Reset active state so the monitor can re-detect existing sink-inputs."""
