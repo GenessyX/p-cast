@@ -13,6 +13,7 @@ from pychromecast import Chromecast
 from pychromecast.controllers.receiver import CastStatus, CastStatusListener
 
 from p_cast.exceptions import SinkError
+from p_cast.tasks import spawn_threadsafe
 
 logger = logging.getLogger(__name__)
 
@@ -38,7 +39,7 @@ class _CastVolumeSync(CastStatusListener):
     """Bridges Chromecast-initiated volume/mute changes back to the PA sink.
 
     new_cast_status() runs on pychromecast's socket thread; the apply
-    coroutine is scheduled onto the event loop via run_coroutine_threadsafe.
+    coroutine is scheduled onto the event loop via spawn_threadsafe.
     """
 
     def __init__(
@@ -61,7 +62,7 @@ class _CastVolumeSync(CastStatusListener):
         muted = status.volume_muted
         if level is None:
             return
-        asyncio.run_coroutine_threadsafe(self._on_volume_change(level, muted), self._loop)
+        spawn_threadsafe(self._loop, self._on_volume_change(level, muted))
 
 
 class SinkController:

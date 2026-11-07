@@ -33,6 +33,7 @@ from p_cast.cast import CastDiscovery, get_local_ip, subscribe_to_stream
 from p_cast.config import MAX_SAMPLE_RATE, StreamConfig
 from p_cast.device import SinkController, SinkInputMonitor
 from p_cast.ffmpeg import create_ffmpeg_stream_command
+from p_cast.tasks import spawn, spawn_threadsafe
 
 logger = logging.getLogger(__name__)
 
@@ -133,10 +134,7 @@ class CastConnectionListener(ConnectionStatusListener):
             return
         if status.status in (CONNECTION_STATUS_LOST, CONNECTION_STATUS_DISCONNECTED):
             logger.warning("Chromecast connection %s: %s", status.status, self._sink_name)
-            asyncio.run_coroutine_threadsafe(
-                self._on_disconnect(self._sink_name),
-                self._loop,
-            )
+            spawn_threadsafe(self._loop, self._on_disconnect(self._sink_name))
 
 
 CAST_CONNECT_TIMEOUT = 10  # seconds to wait for Chromecast connection before giving up
@@ -554,9 +552,9 @@ async def lifespan(  # noqa: C901, PLR0915
                 return
 
     discovery.set_callbacks(
-        on_add=lambda uuid: asyncio.run_coroutine_threadsafe(handle_device_add(uuid), loop),  # type: ignore[arg-type]
-        on_remove=lambda uuid: asyncio.run_coroutine_threadsafe(handle_device_remove(uuid), loop),  # type: ignore[arg-type]
-        on_update=lambda uuid: asyncio.run_coroutine_threadsafe(handle_device_add(uuid), loop),  # type: ignore[arg-type]
+        on_add=lambda uuid: spawn_threadsafe(loop, handle_device_add(uuid)),
+        on_remove=lambda uuid: spawn_threadsafe(loop, handle_device_remove(uuid)),
+        on_update=lambda uuid: spawn_threadsafe(loop, handle_device_add(uuid)),
     )
 
     app.state.controllers = controllers
@@ -590,7 +588,7 @@ async def lifespan(  # noqa: C901, PLR0915
     # gives us a reliable shutdown path that bypasses any signalfd issues.
     try:
         signal.pthread_sigmask(signal.SIG_UNBLOCK, {signal.SIGTERM})
-        loop.add_signal_handler(signal.SIGTERM, lambda: asyncio.create_task(_sigterm_handler()))
+        loop.add_signal_handler(signal.SIGTERM, lambda: spawn(_sigterm_handler()))
     except Exception:
         logger.debug("Could not install SIGTERM handler in event loop", exc_info=True)
 
