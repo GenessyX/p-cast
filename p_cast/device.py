@@ -14,6 +14,7 @@ from pychromecast.controllers.receiver import CastStatus, CastStatusListener
 
 from p_cast.config import DEFAULT_SINK_GAIN
 from p_cast.exceptions import SinkError
+from p_cast.status import status as tracker
 from p_cast.tasks import spawn_threadsafe
 
 logger = logging.getLogger(__name__)
@@ -27,6 +28,14 @@ _SINK_NAME_INVALID_CHARS = re.compile(r"[^a-zA-Z0-9_-]")
 _MIN_AUDIBLE_VOLUME = 0.1
 # Less than a single volume-up/down step; also absorbs PulseAudio's volume quantization.
 _VOLUME_EPSILON = 0.005
+# Keep streaming this long after the last sink-input is gone (track changes, short pauses).
+_DEACTIVATION_GRACE = 15.0
+
+
+def _app_name(sink_input: pulsectl.PulseSinkInputInfo) -> str | None:
+    """Name of the application that plays into a sink-input, as shown by the desktop."""
+    props = typing.cast("dict[str, str]", sink_input.proplist)  # pyright: ignore[reportAttributeAccessIssue]
+    return props.get("application.name") or props.get("application.process.binary") or None
 
 
 def _make_sink_name(chromecast_name: str) -> str:
@@ -339,6 +348,8 @@ class SinkInputMonitor:
         if self._deactivation_task is not None:
             self._deactivation_task.cancel()
             self._deactivation_task = None
+            if self._active_sink is not None:
+                tracker.restore_player_phase(self._active_sink)
 
     async def stop(self) -> None:
         self._cancel_deferred_deactivation()
@@ -383,6 +394,7 @@ class SinkInputMonitor:
                         await self._on_deactivate(self._active_sink)
                     self._active_sink = sink_name
                     logger.info("Existing sink-input detected on: %s", sink_name)
+                    tracker.set_source(_app_name(si))
                     await self._on_activate(sink_name)
 
     async def _monitor(self) -> None:
@@ -430,10 +442,18 @@ class SinkInputMonitor:
                             self._active_sink,
                             sink_name,
                         )
+                        tracker.event(
+                            "info",
+                            "switching",
+                            f"Audio moved to {sink_name}, stopping {self._active_sink}",
+                            sink_name,
+                        )
                         await self._on_deactivate(self._active_sink)
                     self._active_sink = sink_name
                     self._active_sink_inputs.clear()
                     logger.info("Sink activated: %s", sink_name)
+                    tracker.set_source(_app_name(si))
+                    tracker.event("info", "activated", f"Audio from {_app_name(si) or 'an app'}", sink_name)
                     await self._on_activate(sink_name)
                 # A failed activation calls clear_active(); don't track the input then,
                 # so the next event for it retries the activation.
@@ -444,6 +464,7 @@ class SinkInputMonitor:
                 self._active_sink_inputs.discard(sink_input_index)
                 if not self._active_sink_inputs and self._active_sink is not None:
                     logger.info("Sink deactivated (moved away): %s", self._active_sink)
+                    tracker.event("info", "moved_away", "Audio moved to another output", self._active_sink)
                     await self._on_deactivate(self._active_sink)
                     self._active_sink = None
             break
@@ -458,8 +479,9 @@ class SinkInputMonitor:
             self._deactivation_task = asyncio.create_task(
                 self._deferred_deactivate(self._active_sink),
             )
+            tracker.set_phase(self._active_sink, "lingering", timeout=_DEACTIVATION_GRACE, reason="no audio")
 
-    async def _deferred_deactivate(self, sink_name: str, delay_s: int = 15) -> None:
+    async def _deferred_deactivate(self, sink_name: str, delay_s: float = _DEACTIVATION_GRACE) -> None:
         """Wait briefly before deactivating to handle song transitions / avoid excessive reconnects."""
         try:
             await asyncio.sleep(delay_s)
@@ -467,6 +489,7 @@ class SinkInputMonitor:
             return
         if not self._active_sink_inputs and self._active_sink == sink_name:
             logger.info("Sink deactivated (after grace period): %s", sink_name)
+            tracker.event("info", "idle_stop", f"No audio for {delay_s:.0f}s", sink_name)
             await self._on_deactivate(sink_name)
             self._active_sink = None
         self._deactivation_task = None
