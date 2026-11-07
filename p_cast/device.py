@@ -117,7 +117,28 @@ class SinkController:
         if hasattr(self, "_volume_listener"):
             self._volume_listener.cancel()
 
+    async def _remove_leftover_sink(self, name: str) -> None:
+        """Unload a null sink with our name left behind by a previous run that did not exit cleanly.
+
+        Otherwise a second sink with the same name is created, and lookups by name may
+        return the stale one, which nothing reads from.
+        """
+        try:
+            sink = await self._pulse.get_sink_by_name(name)
+        except pulsectl.PulseIndexError:
+            return
+        module_index: int = sink.owner_module  # pyright: ignore[reportAttributeAccessIssue]
+        try:
+            module = await self._pulse.module_info(module_index)
+        except pulsectl.PulseIndexError:
+            return
+        if module.name != "module-null-sink":  # pyright: ignore[reportAttributeAccessIssue]
+            return
+        logger.warning("Removing leftover sink %s (module %d) from a previous run", name, module_index)
+        await self._pulse.module_unload(module_index)
+
     async def create_sink(self, name: str, friendly_name: str) -> int:
+        await self._remove_leftover_sink(name)
         sink_properties = [
             f"device.description='{friendly_name}'",
             "channelmix.min-volume=5.0",
