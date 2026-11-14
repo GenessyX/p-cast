@@ -1,5 +1,6 @@
 import asyncio
 import contextlib
+import ipaddress
 import logging
 import os
 import signal
@@ -11,6 +12,8 @@ from functools import partial
 from typing import override
 from uuid import UUID
 
+from pychromecast import Chromecast
+from pychromecast.config import APP_BACKDROP, APP_MEDIA_RECEIVER
 from pychromecast.controllers.media import MediaStatus, MediaStatusListener
 from pychromecast.error import RequestTimeout
 from pychromecast.socket_client import (
@@ -30,7 +33,7 @@ from starlette.routing import Route
 from starlette.staticfiles import StaticFiles
 
 from p_cast.cast import CastDiscovery, get_local_ip, subscribe_to_stream
-from p_cast.config import MAX_SAMPLE_RATE, StreamConfig
+from p_cast.config import DEFAULT_SINK_GAIN, MAX_SAMPLE_RATE, StreamConfig
 from p_cast.device import SinkController, SinkInputMonitor
 from p_cast.ffmpeg import create_ffmpeg_stream_command
 
@@ -52,8 +55,24 @@ def _sd_notify(state: str) -> None:
 
 _FFMPEG_STARTUP_DELAY = 0.5
 _STREAM_SUBSCRIBE_DELAY = 2
+_APP_QUIT_DELAY = 1.0
 _FFMPEG_RESTART_DELAY = 2  # seconds to wait before restarting a stream whose FFmpeg exited
 _BUFFERING_RECOVER_TIMEOUT = 6  # seconds of sustained BUFFERING before restarting stream (6 is minimum)
+
+
+def _normalize_host(host: str) -> str:
+    """Return a canonical form of an IP address so that equal addresses compare equal.
+
+    zeroconf may report the same IPv4 address as an IPv4-mapped IPv6 address
+    (e.g. ``::ffff:a0a:32b7`` or ``[::ffff:a0a:32b7]`` for ``10.10.50.183``).
+    """
+    try:
+        ip = ipaddress.ip_address(host.removeprefix("[").removesuffix("]"))
+    except ValueError:
+        return host
+    if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped is not None:
+        return str(ip.ipv4_mapped)
+    return str(ip)
 
 
 async def _tcp_probe(host: str, port: int, probe_timeout: float = 3.0) -> bool:
@@ -223,6 +242,7 @@ class ActiveStream:
 
     def __init__(
         self,
+        sink_name: str,
         ffmpeg_process: asyncio.subprocess.Process,
         stream_dir: tempfile.TemporaryDirectory[str],
         stream_app: StaticFilesWithCORS,
@@ -232,6 +252,7 @@ class ActiveStream:
         connection_listener: CastConnectionListener,
         buffering_watchdog: BufferingWatchdog,
     ) -> None:
+        self.sink_name = sink_name
         self.ffmpeg_process = ffmpeg_process
         self.stream_dir = stream_dir
         self.stream_app = stream_app
@@ -250,7 +271,7 @@ class ActiveStream:
             self.ffmpeg_watcher.cancel()
         with contextlib.suppress(Exception):
             # tell it to stop, but don't quit() the CC app (and trigger a disconnect)
-            self.volume_controller.cast.media_controller.stop(timeout=1.0)
+            await asyncio.to_thread(self.volume_controller.cast.media_controller.stop, timeout=1.0)
         if self.ffmpeg_process.returncode is None:
             self.ffmpeg_process.terminate()
             await self.ffmpeg_process.wait()
@@ -268,6 +289,7 @@ async def lifespan(  # noqa: C901, PLR0915
     stream_config: StreamConfig,
     discovery: CastDiscovery,
     streaming_port: int,
+    sink_gain: float = DEFAULT_SINK_GAIN,
 ) -> AsyncIterator[None]:
     for controller in controllers.values():
         await controller.init()
@@ -292,17 +314,26 @@ async def lifespan(  # noqa: C901, PLR0915
         await monitor.refresh_sink_indices()
         monitor.clear_active()
 
-    async def on_activate(sink_name: str) -> None:  # noqa: PLR0915, C901
+    async def _activate(sink_name: str) -> None:  # noqa: PLR0915, C901
         nonlocal active_stream
         nonlocal local_ip
 
         controller = controllers[sink_name]
         if not controller.available:
             logger.warning("Skipping activation for unavailable device: %s", sink_name)
+            # Let the monitor retry on the next sink-input event instead of
+            # believing this sink is streaming.
+            monitor.clear_active()
             return
 
-        if not local_ip:
+        # Resolve on every activation: a laptop may have moved to another network
+        # (or got a new DHCP lease) since the previous one.
+        try:
             local_ip = get_local_ip()
+        except OSError:
+            if not local_ip:
+                raise
+            logger.warning("Could not determine local IP, reusing %s", local_ip)
 
         # Stop any leftover socket thread from the previous chromecast object.
         # No-op on first activation (socket thread not started until wait()).
@@ -397,6 +428,13 @@ async def lifespan(  # noqa: C901, PLR0915
             async def subscribe() -> None:
                 await asyncio.sleep(_STREAM_SUBSCRIBE_DELAY)
                 try:
+                    # A device that is still running another receiver app (e.g. the follower
+                    # app it runs while part of a speaker group) rejects LOAD with
+                    # INVALID_REQUEST. Quit it first so the default media receiver is launched.
+                    if cast.app_id not in (None, APP_BACKDROP, APP_MEDIA_RECEIVER):
+                        logger.info("Quitting app %s on %s before loading stream", cast.app_id, sink_name)
+                        await asyncio.to_thread(cast.quit_app)
+                        await asyncio.sleep(_APP_QUIT_DELAY)
                     subscribe_to_stream(cast.media_controller, local_ip, streaming_port, stream_config)
                 except Exception:
                     logger.exception("Failed to subscribe Chromecast to stream")
@@ -429,6 +467,7 @@ async def lifespan(  # noqa: C901, PLR0915
             ffmpeg_watcher = asyncio.create_task(watch_ffmpeg(ffmpeg_process))
 
             active_stream = ActiveStream(
+                sink_name=sink_name,
                 ffmpeg_process=ffmpeg_process,
                 stream_dir=stream_dir,
                 stream_app=stream_app,
@@ -443,6 +482,7 @@ async def lifespan(  # noqa: C901, PLR0915
 
         except Exception:
             logger.exception("Failed to activate stream for sink: %s", sink_name)
+            monitor.clear_active()
             if subscribe_task is not None:
                 subscribe_task.cancel()
             if ffmpeg_watcher is not None:
@@ -452,9 +492,12 @@ async def lifespan(  # noqa: C901, PLR0915
                 await ffmpeg_process.wait()
             stream_dir.cleanup()
 
-    async def on_deactivate(sink_name: str) -> None:
+    async def _deactivate(sink_name: str) -> None:
         nonlocal active_stream
 
+        if active_stream is not None and active_stream.sink_name != sink_name:
+            logger.debug("Not deactivating %s: active stream belongs to %s", sink_name, active_stream.sink_name)
+            return
         if active_stream is not None:
             logger.info("Deactivating cast from sink: %s", sink_name)
             await active_stream.teardown()
@@ -464,9 +507,34 @@ async def lifespan(  # noqa: C901, PLR0915
             with contextlib.suppress(TimeoutError):
                 controllers[sink_name].cast.disconnect(timeout=0.0)
 
+    # Activation, deactivation and restarts are triggered from several places (sink-input
+    # monitor, buffering watchdog, connection listener, mDNS callbacks). Serialize them so
+    # an activation that is still waiting for its Chromecast cannot interleave with another
+    # one and leave an orphaned FFmpeg process or overwrite active_stream.
+    activation_lock = asyncio.Lock()
+
+    async def on_activate(sink_name: str) -> None:
+        async with activation_lock:
+            if active_stream is not None:
+                logger.warning(
+                    "Stream for %s still active while activating %s, tearing it down",
+                    active_stream.sink_name,
+                    sink_name,
+                )
+                await _deactivate(active_stream.sink_name)
+            await _activate(sink_name)
+
+    async def on_deactivate(sink_name: str) -> None:
+        async with activation_lock:
+            await _deactivate(sink_name)
+
     async def restart_stream(sink_name: str) -> None:
-        await on_deactivate(sink_name)
-        await on_activate(sink_name)
+        async with activation_lock:
+            if monitor.active_sink != sink_name:
+                logger.info("Not restarting %s: it is no longer the active sink", sink_name)
+                return
+            await _deactivate(sink_name)
+            await _activate(sink_name)
 
     monitor = SinkInputMonitor(
         controllers=controllers,
@@ -496,8 +564,17 @@ async def lifespan(  # noqa: C901, PLR0915
         return None
 
     def address_matches(controller: SinkController, new_address: tuple[str, int]) -> bool:
-        current_address = (controller.cast.cast_info.host, controller.cast.cast_info.port)
-        return new_address == current_address
+        current_host, current_port = controller.cast.cast_info.host, controller.cast.cast_info.port
+        new_host, new_port = new_address
+        return _normalize_host(new_host) == _normalize_host(current_host) and new_port == current_port
+
+    async def handle_address_change(controller: SinkController, chromecast: Chromecast) -> None:
+        """Point an available controller at the device's new address without removing its sink."""
+        if active_stream is not None and monitor.active_sink == controller.sink_name:
+            # on_activate disconnects the old cast and connects to the new address
+            await restart_stream(controller.sink_name)
+        else:
+            controller.cast = chromecast
 
     _handling_devices: set[UUID] = set()
 
@@ -512,21 +589,24 @@ async def lifespan(  # noqa: C901, PLR0915
         finally:
             _handling_devices.discard(device_id)
 
-    async def _handle_device_add(device_id: UUID) -> None:
+    async def _handle_device_add(device_id: UUID) -> None:  # noqa: C901
         """React to mDNS add_service or update_service events to recover previously unavailable devices,
         mark newly unreachable devices unavailable, and handle potential IP changes."""
         controller = get_controller(device_id)
+        address_changed = False
         if controller:
             new_address = discovery.get_device_address(device_id)
             if new_address is None:
                 return
             if controller.available and not address_matches(controller, new_address):
+                # Common for speaker groups: the group leader (and with it the address)
+                # moves between members. Keep the sink so audio routed to it stays put.
                 logger.info(
-                    "Device %s address changed to: %s:%d, re-adding",
+                    "Device %s address changed to: %s:%d, reconnecting",
                     controller.sink_name,
                     *new_address,
                 )
-                await mark_device_unavailable(controller.sink_name, controller)
+                address_changed = True
             elif not controller.available and not await _tcp_probe(*new_address):
                 # Cheap pre-filter: skip expensive wait() if TCP is dead
                 logger.debug("TCP probe failed for %s at %s:%d", controller.sink_name, *new_address)
@@ -563,7 +643,7 @@ async def lifespan(  # noqa: C901, PLR0915
             return
 
         if not controller:
-            controller = SinkController(chromecast=chromecast)
+            controller = SinkController(chromecast=chromecast, sink_gain=sink_gain)
             await controller.init()
             controllers[controller.sink_name] = controller
             logger.info("Device added: %s", controller.sink_name)
@@ -571,6 +651,8 @@ async def lifespan(  # noqa: C901, PLR0915
             controller.available = True
             await controller.init()
             logger.info("Device restored: %s", controller.sink_name)
+        elif address_changed:
+            await handle_address_change(controller, chromecast)
         await monitor.refresh_sink_indices()
 
     async def handle_device_remove(device_id: UUID) -> None:
@@ -643,7 +725,7 @@ async def pause(request: Request) -> Response:
     media_controller = _get_active_media_controller(request)
     if media_controller is None:
         return Response(content="No active device", status_code=404)
-    media_controller.pause()
+    await asyncio.to_thread(media_controller.pause)
     return Response(content="OK")
 
 
@@ -651,8 +733,8 @@ async def play(request: Request) -> Response:
     media_controller = _get_active_media_controller(request)
     if media_controller is None:
         return Response(content="No active device", status_code=404)
-    media_controller.play()
-    media_controller.seek(None)  # pyright: ignore[reportArgumentType]
+    await asyncio.to_thread(media_controller.play)
+    await asyncio.to_thread(media_controller.seek, None)  # pyright: ignore[reportArgumentType]
     return Response(content="OK")
 
 
@@ -694,6 +776,7 @@ def create_app() -> Starlette:
     chromecasts = discovery.discover()
 
     streaming_port = int(os.environ["PCAST_PORT"])
+    sink_gain = float(os.environ.get("PCAST_SINK_GAIN", DEFAULT_SINK_GAIN))
     stream_config = StreamConfig(
         acodec="aac",
         bitrate=os.environ["PCAST_BITRATE"],
@@ -704,6 +787,7 @@ def create_app() -> Starlette:
     for chromecast in chromecasts:
         controller = SinkController(
             chromecast=chromecast,
+            sink_gain=sink_gain,
         )
         controllers[controller.sink_name] = controller
 
@@ -734,6 +818,7 @@ def create_app() -> Starlette:
             stream_config=stream_config,
             discovery=discovery,
             streaming_port=streaming_port,
+            sink_gain=sink_gain,
         ),
         middleware=middleware,
     )
