@@ -1,6 +1,159 @@
 # CHANGELOG
 
 
+## v2.1.0 (2026-11-14)
+
+### Bug Fixes
+
+- Default virtual sink gain to unity
+  ([`b7c74bb`](https://github.com/GenessyX/p-cast/commit/b7c74bb73cabef7259e1e6b179a5f8bef1b422e9))
+
+- Keep references to background tasks to prevent a segfault
+  ([`31da01b`](https://github.com/GenessyX/p-cast/commit/31da01b4c131676837318061532a77aa99131dc6))
+
+Device add/remove/update handlers, the connection-lost handler and the cast volume handler were
+  scheduled with asyncio.run_coroutine_threadsafe and the returned future was dropped. The event
+  loop only keeps weak references to tasks, so such a task can be garbage collected while it is
+  still running.
+
+When that happens during SinkController.init() for a new device, the task is the only thing
+  referencing the new PulseAsync and its ctypes callbacks (the controller is stored in `controllers`
+  only after init()). The garbage collector frees them while libpulse still has the callbacks
+  registered; the next libpulse dispatch calls a freed ctypes closure and the process segfaults:
+
+ERROR:asyncio:Task was destroyed but it is pending! task: <Task pending name='Task-25'
+  coro=<lifespan.<locals>.handle_device_add() ... python3: segfault at 48 ... in python3.13 #0
+  closure_fcn #1 ffi_closure_unix64_inner #3 libpulse.so.0 #5 pa_pdispatch_run
+
+Add p_cast/tasks.py with spawn() / spawn_threadsafe(), which keep a strong reference to each task
+  until it finishes and log exceptions that were previously lost in the dropped futures. Use them
+  for all fire-and-forget tasks.
+
+- Keep sink when a device changes address
+  ([`6c875bf`](https://github.com/GenessyX/p-cast/commit/6c875bf443bde3e826515fd164e04e83bcb19be1))
+
+Speaker groups change address whenever the group leader moves to another member. p-cast treated this
+  as the device going away: it removed the sink, so PipeWire moved the playing stream to another
+  sink (another cast or the local speakers), and the sink only came back after a later mDNS update.
+
+Keep the sink and only reconnect: restart the stream if the device is the active one, otherwise just
+  swap in the new Chromecast object. A device that fails the health check at its new address is
+  still marked unavailable as before.
+
+- Prevent volume feedback loop while set_volume is in flight
+  ([`55f7a67`](https://github.com/GenessyX/p-cast/commit/55f7a6792ed4834218d447eee671995e82cf070d))
+
+With set_volume running in a thread, the event loop keeps processing cast status updates while the
+  request waits for the device. A status sent for an earlier request then differed from
+  _synced_volume (only updated after the await), so it was written to the PA sink; that sink change
+  was read back as a user change and sent to the device, and the two directions kept overriding each
+  other (volume bouncing between two values forever after a few quick changes).
+
+- Update _synced_volume / _synced_mute before awaiting the cast call. - Ignore cast statuses while
+  one of our own requests is in flight. - Compare PA volumes with the same epsilon as cast statuses,
+  so PA's volume quantization of a cast-initiated change is not sent back to the device.
+
+- Quit foreign receiver app before loading stream
+  ([`5fddeea`](https://github.com/GenessyX/p-cast/commit/5fddeea26058e5223438b9e3424de5524e56e8c1))
+
+A Chromecast that was last used as part of a speaker group keeps running the group follower app.
+  Sending LOAD to it fails with INVALID_REQUEST, so switching from a group sink to one of its member
+  sinks produced silence. Quit any app other than the backdrop or default media receiver before
+  subscribing to the stream.
+
+- Remove leftover sinks from a previous run
+  ([`32fda74`](https://github.com/GenessyX/p-cast/commit/32fda740a04575144448cdd0e0dd6c696825c6a8))
+
+If p-cast does not exit cleanly (crash, SIGKILL), its null-sink modules stay loaded. On the next
+  start a second sink with the same name was created; lookups by name could return the stale sink,
+  so audio was routed to a sink nobody reads from.
+
+Before creating a sink, unload an existing module-null-sink that owns a sink with the same name. The
+  instance lock guarantees no other p-cast instance is using it.
+
+- Reset monitor state when stream activation fails
+  ([`cd8b302`](https://github.com/GenessyX/p-cast/commit/cd8b302e1f9a5682e45b3e5ae17be9f30524f184))
+
+The sink-input monitor marks a sink active before calling on_activate. When the activation was
+  skipped (device unavailable) or raised, the sink stayed marked active with no stream behind it.
+  Later sink-input events on the same sink did not retry the activation, so audio routed to it
+  stayed silent until the user switched to another sink.
+
+Call monitor.clear_active() on those paths, as the other failure paths already do, and only track
+  the sink-input when the activation succeeded.
+
+- Resolve the local IP on every activation
+  ([`2769b85`](https://github.com/GenessyX/p-cast/commit/2769b8585d2bf28cb45d26fb144d6990c633830b))
+
+The local IP used in the stream URL was resolved once, on the first activation, and reused for the
+  lifetime of the process. After the host moved to another network or got a new address, the
+  Chromecast was told to fetch the stream from the old address and stayed silent until p-cast was
+  restarted. Resolve it on every activation, falling back to the previous address if the lookup
+  fails.
+
+- Restart the stream when FFmpeg exits, and drain its stderr
+  ([`d4078b4`](https://github.com/GenessyX/p-cast/commit/d4078b400829801cf3a2357cef532a947186bd48))
+
+FFmpeg was only checked for an immediate exit at startup. If it exited later (e.g. PipeWire
+  restarted), nothing noticed: the HLS playlist stopped updating and, unless the Chromecast reported
+  BUFFERING long enough for the watchdog, playback stayed silent. Its stderr pipe was also never
+  read after startup, so enough error output could fill the pipe and block FFmpeg.
+
+Watch the FFmpeg process for the lifetime of the stream: log its stderr lines and restart the stream
+  if it exits unexpectedly.
+
+Also compare player_state with == instead of a substring test.
+
+- Run blocking pychromecast calls off the event loop
+  ([`03e352a`](https://github.com/GenessyX/p-cast/commit/03e352a1419b3f53848a2d72743d3bbafa40dd16))
+
+set_volume, set_volume_muted, stop, play, pause and seek wait for the device's reply (up to 10 s).
+  They were called directly on the event loop, which also serves the HLS playlist and segments to
+  the Chromecast. A slow reply, e.g. while changing the volume on a busy network, stalled segment
+  delivery and could make the Chromecast buffer.
+
+Run them with asyncio.to_thread.
+
+- Serialize stream activation, deactivation and restarts
+  ([`1024e57`](https://github.com/GenessyX/p-cast/commit/1024e574791b91d934189f85bb202b5dfa293bae))
+
+on_activate, on_deactivate and restart_stream are called from the sink-input monitor, the buffering
+  watchdog, the connection listener and the mDNS callbacks. An activation can wait up to ~12 s for
+  the Chromecast, and meanwhile another path could start a second activation. The later one
+  overwrote active_stream and left the first FFmpeg process and cast connection running.
+
+Guard all three with an asyncio.Lock. Record the sink name in ActiveStream so a stale deactivation
+  cannot tear down another sink's stream, tear down any leftover stream before activating, and skip
+  a restart when the sink is no longer the active one.
+
+- Treat IPv4-mapped IPv6 addresses as the same host
+  ([`71c0103`](https://github.com/GenessyX/p-cast/commit/71c010394d19e3db85a0451ecf9cc08825926bc5))
+
+Discovery can report a device's IPv4 address as an IPv4-mapped IPv6 address (::ffff:a0a:32b7 or
+  [::ffff:a0a:32b7] for 10.10.50.183) and switch back later. This was detected as an address change
+  and restarted the active stream. Normalize both addresses before comparing them.
+
+### Chores
+
+- Add ci, move dev dependencies to optional group
+  ([`6229424`](https://github.com/GenessyX/p-cast/commit/62294242d012e1d4ee5598f294458413009d716e))
+
+- Merge main into address-change fix
+  ([`a1e161c`](https://github.com/GenessyX/p-cast/commit/a1e161caf86ef7a8ee00d1db7fdc4800ce8cebd3))
+
+- Merge main into FFmpeg watcher fix
+  ([`c04c7fa`](https://github.com/GenessyX/p-cast/commit/c04c7fa4a9cbf4dffbd0ea4c018ebd708b4edc54))
+
+### Features
+
+- Add --sink-gain option for the virtual sink gain
+  ([`6ee9c1b`](https://github.com/GenessyX/p-cast/commit/6ee9c1bd8551c4b87207f9f9598f823b00caf8a1))
+
+The virtual sinks apply a fixed channelmix gain of 5.0 (about +14 dB). Any source playing near full
+  scale clips, which is audible as crackling on the Chromecast. Make the gain configurable so users
+  can pick 1.0 (unity). The default stays 5.0 to keep the current behavior.
+
+
 ## v2.0.0 (2026-03-01)
 
 ### Bug Fixes
