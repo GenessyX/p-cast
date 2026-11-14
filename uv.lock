@@ -470,11 +470,11 @@ types = [
 
 [package.metadata]
 requires-dist = [
-    { name = "granian", specifier = ">=2.2.5" },
-    { name = "pulsectl-asyncio", specifier = ">=1.2.2" },
-    { name = "pychromecast", specifier = ">=14.0.7" },
-    { name = "starlette", specifier = ">=0.46.2" },
-    { name = "uvloop", specifier = ">=0.21.0" },
+    { name = "granian", specifier = ">=2.2.5,<3" },
+    { name = "pulsectl-asyncio", specifier = ">=1.2.2,<2" },
+    { name = "pychromecast", specifier = ">=14.0.7,<15" },
+    { name = "starlette", specifier = ">=0.46.2,<0.47" },
+    { name = "uvloop", specifier = ">=0.21.0,<0.22" },
 ]
 
 [package.metadata.requires-dev]
