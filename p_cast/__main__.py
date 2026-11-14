@@ -8,6 +8,8 @@ from granian.constants import Interfaces, Loops
 from granian.log import LogLevels
 from granian.server import Server
 
+from p_cast.config import DEFAULT_SINK_GAIN
+
 # Held open for the lifetime of the process; closing it releases the lock.
 _instance_lock = None
 
@@ -96,10 +98,21 @@ def main() -> None:
         help="detach from terminal and run as a background daemon (requires --log-file)",
     )
     parser.add_argument("--pid-file", default=None, metavar="PATH", help="write PID to this file on startup")
+    parser.add_argument(
+        "--sink-gain",
+        type=float,
+        default=DEFAULT_SINK_GAIN,
+        metavar="GAIN",
+        help=f"fixed linear gain applied by the virtual sinks; 1.0 is unity (default: {DEFAULT_SINK_GAIN})",
+    )
     args = parser.parse_args()
 
     if not bitrate_ok(args.bitrate):
         sys.stderr.write(f"Provided bitrate is invalid or above {MAX_AAC_BITRATE}k: {args.bitrate}\n")
+        sys.exit(1)
+
+    if args.sink_gain <= 0:
+        sys.stderr.write(f"error: --sink-gain must be positive: {args.sink_gain}\n")
         sys.exit(1)
 
     if args.daemonize and args.log_file == "console":
@@ -121,6 +134,7 @@ def main() -> None:
     os.environ["PCAST_PORT"] = str(args.port)
     os.environ["PCAST_FFMPEG"] = args.ffmpeg
     os.environ["PCAST_LOG_LEVEL"] = args.log_level
+    os.environ["PCAST_SINK_GAIN"] = str(args.sink_gain)
     if args.log_file != "console":
         os.environ["PCAST_LOG_FILE"] = args.log_file
 
