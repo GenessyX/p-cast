@@ -1,5 +1,7 @@
 import asyncio
 import contextlib
+import ipaddress
+import itertools
 import logging
 import os
 import signal
@@ -11,6 +13,7 @@ from functools import partial
 from typing import override
 from uuid import UUID
 
+from pychromecast import Chromecast
 from pychromecast.config import APP_BACKDROP, APP_MEDIA_RECEIVER
 from pychromecast.controllers.media import MediaStatus, MediaStatusListener
 from pychromecast.error import RequestTimeout
@@ -27,13 +30,16 @@ from starlette.middleware.cors import CORSMiddleware
 from starlette.middleware.gzip import GZipMiddleware
 from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
-from starlette.routing import Route
+from starlette.routing import Route, WebSocketRoute
 from starlette.staticfiles import StaticFiles
+from starlette.websockets import WebSocket, WebSocketDisconnect
 
 from p_cast.cast import CastDiscovery, get_local_ip, subscribe_to_stream
-from p_cast.config import MAX_SAMPLE_RATE, StreamConfig
+from p_cast.config import DEFAULT_SINK_GAIN, MAX_SAMPLE_RATE, StreamConfig
 from p_cast.device import SinkController, SinkInputMonitor
 from p_cast.ffmpeg import create_ffmpeg_stream_command
+from p_cast.status import status as tracker
+from p_cast.tasks import spawn, spawn_threadsafe
 
 logger = logging.getLogger(__name__)
 
@@ -54,7 +60,28 @@ def _sd_notify(state: str) -> None:
 _FFMPEG_STARTUP_DELAY = 0.5
 _STREAM_SUBSCRIBE_DELAY = 2
 _APP_QUIT_DELAY = 1.0
+_FFMPEG_RESTART_DELAY = 2  # seconds to wait before restarting a stream whose FFmpeg exited
 _BUFFERING_RECOVER_TIMEOUT = 6  # seconds of sustained BUFFERING before restarting stream (6 is minimum)
+# Seconds between reconnection attempts to a device whose connection was lost; the last
+# value repeats. mDNS does not re-announce a device that only dropped off for a moment
+# (Wi-Fi hiccup, the PC resuming from suspend), so without retries it stays unavailable
+# until its record expires.
+_RECONNECT_DELAYS = (5, 10, 20, 30, 60)
+
+
+def _normalize_host(host: str) -> str:
+    """Return a canonical form of an IP address so that equal addresses compare equal.
+
+    zeroconf may report the same IPv4 address as an IPv4-mapped IPv6 address
+    (e.g. ``::ffff:a0a:32b7`` or ``[::ffff:a0a:32b7]`` for ``10.10.50.183``).
+    """
+    try:
+        ip = ipaddress.ip_address(host.removeprefix("[").removesuffix("]"))
+    except ValueError:
+        return host
+    if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped is not None:
+        return str(ip.ipv4_mapped)
+    return str(ip)
 
 
 async def _tcp_probe(host: str, port: int, probe_timeout: float = 3.0) -> bool:
@@ -90,6 +117,8 @@ class StaticFilesWithCORS(BaseHTTPMiddleware):
             # Race: temp dir was cleaned up (stream teardown) while a segment
             # request was in-flight. Return 404 rather than crashing the server.
             return Response(status_code=404)
+        if response.status_code == 200:  # noqa: PLR2004
+            tracker.http_fetch(request.url.path)
 
         # raw_length = response.headers.get("content-length")
         # content_length = int(raw_length) / 1024 if raw_length else 0
@@ -135,10 +164,16 @@ class CastConnectionListener(ConnectionStatusListener):
             return
         if status.status in (CONNECTION_STATUS_LOST, CONNECTION_STATUS_DISCONNECTED):
             logger.warning("Chromecast connection %s: %s", status.status, self._sink_name)
-            asyncio.run_coroutine_threadsafe(
-                self._on_disconnect(self._sink_name),
-                self._loop,
+            self._loop.call_soon_threadsafe(
+                partial(
+                    tracker.event,
+                    "warning",
+                    "connection_lost",
+                    f"Connection to the Chromecast {status.status.lower()}",
+                    self._sink_name,
+                ),
             )
+            spawn_threadsafe(self._loop, self._on_disconnect(self._sink_name))
 
 
 CAST_CONNECT_TIMEOUT = 10  # seconds to wait for Chromecast connection before giving up
@@ -167,7 +202,13 @@ class BufferingWatchdog(MediaStatusListener):
     def new_media_status(self, status: MediaStatus) -> None:
         if not self._active:
             return
-        if status.player_state in "BUFFERING":
+        self._loop.call_soon_threadsafe(
+            tracker.player_state,
+            self._sink_name,
+            status.player_state,
+            _BUFFERING_RECOVER_TIMEOUT,
+        )
+        if status.player_state == "BUFFERING":
             self._loop.call_soon_threadsafe(self._start_timer)
         else:  # PAUSED, PLAYING, IDLE, UNKNOWN
             self._loop.call_soon_threadsafe(self._cancel_timer)
@@ -180,19 +221,29 @@ class BufferingWatchdog(MediaStatusListener):
             queue_item_id,
             error_code,  # see pychromecast.controllers.media.MEDIA_PLAYER_ERROR_CODES for interpretation
         )
+        self._loop.call_soon_threadsafe(
+            partial(
+                tracker.event,
+                "error",
+                "load_failed",
+                f"Chromecast failed to load the stream (error {error_code})",
+                self._sink_name,
+                error=error_code,
+            ),
+        )
 
     def _start_timer(self) -> None:
         """Schedule recovery if not already pending. Called on event loop."""
         if self._timer_task is None or self._timer_task.done():
             self._timer_task = asyncio.create_task(self._recover_after_timeout())
-            logger.info("Buffering watchdog: starting recovery timer for %s", self._sink_name)
+            logger.debug("Buffering watchdog: starting recovery timer for %s", self._sink_name)
 
     def _cancel_timer(self) -> None:
         """Cancel a pending recovery timer. Called on event loop."""
         if self._timer_task is not None:
             self._timer_task.cancel()
             self._timer_task = None
-            logger.info("Buffering watchdog: cancelling recovery timer for %s", self._sink_name)
+            logger.debug("Buffering watchdog: cancelling recovery timer for %s", self._sink_name)
 
     async def _recover_after_timeout(self) -> None:
         try:
@@ -207,6 +258,13 @@ class BufferingWatchdog(MediaStatusListener):
             "Buffering watchdog: %ds without recovery for %s, restarting stream",
             _BUFFERING_RECOVER_TIMEOUT,
             self._sink_name,
+        )
+        tracker.event(
+            "warning",
+            "buffering_restart",
+            f"Buffering for {_BUFFERING_RECOVER_TIMEOUT}s, restarting the stream",
+            self._sink_name,
+            seconds=_BUFFERING_RECOVER_TIMEOUT,
         )
         await self._on_recover(self._sink_name)
 
@@ -224,18 +282,22 @@ class ActiveStream:
 
     def __init__(
         self,
+        sink_name: str,
         ffmpeg_process: asyncio.subprocess.Process,
         stream_dir: tempfile.TemporaryDirectory[str],
         stream_app: StaticFilesWithCORS,
         subscribe_task: asyncio.Task[None],
+        ffmpeg_watcher: asyncio.Task[None],
         volume_controller: SinkController,
         connection_listener: CastConnectionListener,
         buffering_watchdog: BufferingWatchdog,
     ) -> None:
+        self.sink_name = sink_name
         self.ffmpeg_process = ffmpeg_process
         self.stream_dir = stream_dir
         self.stream_app = stream_app
         self.subscribe_task = subscribe_task
+        self.ffmpeg_watcher = ffmpeg_watcher
         self.volume_controller = volume_controller
         self.connection_listener = connection_listener
         self.buffering_watchdog = buffering_watchdog
@@ -244,9 +306,12 @@ class ActiveStream:
         self.connection_listener.deactivate()
         self.buffering_watchdog.cancel()
         self.subscribe_task.cancel()
+        # The watcher itself may be tearing the stream down (restart after FFmpeg exited).
+        if self.ffmpeg_watcher is not asyncio.current_task():
+            self.ffmpeg_watcher.cancel()
         with contextlib.suppress(Exception):
             # tell it to stop, but don't quit() the CC app (and trigger a disconnect)
-            self.volume_controller.cast.media_controller.stop(timeout=1.0)
+            await asyncio.to_thread(self.volume_controller.cast.media_controller.stop, timeout=1.0)
         if self.ffmpeg_process.returncode is None:
             self.ffmpeg_process.terminate()
             await self.ffmpeg_process.wait()
@@ -264,9 +329,13 @@ async def lifespan(  # noqa: C901, PLR0915
     stream_config: StreamConfig,
     discovery: CastDiscovery,
     streaming_port: int,
+    sink_gain: float = DEFAULT_SINK_GAIN,
 ) -> AsyncIterator[None]:
     for controller in controllers.values():
         await controller.init()
+        tracker.add_device(controller.sink_name, controller.cast.name)
+    tracker.port = streaming_port
+    tracker.event("info", "started", f"p-cast started, {len(controllers)} device(s) found", count=len(controllers))
 
     active_stream: ActiveStream | None = None
     local_ip = None  # defer initialization until we have devices (and thus a network up)
@@ -282,23 +351,36 @@ async def lifespan(  # noqa: C901, PLR0915
         logger.warning("Chromecast disconnected, tearing down sink: %s", sink_name)
         await on_deactivate(sink_name)
         controller.available = False
+        tracker.set_phase(sink_name, "unavailable", reason="connection lost")
         with contextlib.suppress(TimeoutError):
             controller.cast.disconnect(timeout=0.0)
         await controller.remove_sink()
         await monitor.refresh_sink_indices()
         monitor.clear_active()
+        schedule_reconnect(controller, "connection lost")
 
-    async def on_activate(sink_name: str) -> None:  # noqa: PLR0915, C901
+    async def _activate(sink_name: str) -> None:  # noqa: PLR0915, C901
         nonlocal active_stream
         nonlocal local_ip
 
         controller = controllers[sink_name]
         if not controller.available:
             logger.warning("Skipping activation for unavailable device: %s", sink_name)
+            tracker.event("warning", "skip_unavailable", "Audio sent to a device that is not available", sink_name)
+            # Let the monitor retry on the next sink-input event instead of
+            # believing this sink is streaming.
+            monitor.clear_active()
             return
 
-        if not local_ip:
+        # Resolve on every activation: a laptop may have moved to another network
+        # (or got a new DHCP lease) since the previous one.
+        try:
             local_ip = get_local_ip()
+        except OSError:
+            if not local_ip:
+                raise
+            logger.warning("Could not determine local IP, reusing %s", local_ip)
+        tracker.local_ip = local_ip
 
         # Stop any leftover socket thread from the previous chromecast object.
         # No-op on first activation (socket thread not started until wait()).
@@ -307,12 +389,16 @@ async def lifespan(  # noqa: C901, PLR0915
         cast = discovery.create_chromecast(controller.device_id)
         if cast is None:
             logger.warning("Device gone from zeroconf during activation: %s", sink_name)
+            tracker.set_phase(sink_name, "unavailable", reason="gone from mDNS")
+            tracker.event("warning", "gone", "Device disappeared from the network", sink_name)
             controller.available = False
             await controller.remove_sink()
             await monitor.refresh_sink_indices()
             monitor.clear_active()
             return
         controller.cast = cast
+        tracker.set_phase(sink_name, "connecting", timeout=CAST_CONNECT_TIMEOUT)
+        tracker.event("info", "connecting", "Connecting to the Chromecast", sink_name)
         with contextlib.suppress(RequestTimeout):
             await asyncio.to_thread(cast.wait, timeout=CAST_CONNECT_TIMEOUT)
             # (cast.status will be None upon timeout)
@@ -323,17 +409,27 @@ async def lifespan(  # noqa: C901, PLR0915
                 CAST_CONNECT_TIMEOUT,
                 sink_name,
             )
+            tracker.set_phase(sink_name, "unavailable", reason="not reachable")
+            tracker.event(
+                "error",
+                "not_reachable",
+                f"Chromecast not reachable within {CAST_CONNECT_TIMEOUT}s",
+                sink_name,
+                seconds=CAST_CONNECT_TIMEOUT,
+            )
             controller.available = False
             with contextlib.suppress(TimeoutError):
                 cast.disconnect(timeout=0.0)
             await controller.remove_sink()
             await monitor.refresh_sink_indices()
             monitor.clear_active()
+            schedule_reconnect(controller, "not reachable")
             return
 
         stream_dir = tempfile.TemporaryDirectory()
         ffmpeg_process: asyncio.subprocess.Process | None = None
         subscribe_task: asyncio.Task[None] | None = None
+        ffmpeg_watcher: asyncio.Task[None] | None = None
 
         try:
             sink_info = await controller.get_sink()
@@ -353,6 +449,7 @@ async def lifespan(  # noqa: C901, PLR0915
             )
             logger.info("Starting ffmpeg: %s", " ".join(ffmpeg_command))
 
+            tracker.set_phase(sink_name, "encoder", timeout=_FFMPEG_STARTUP_DELAY)
             ffmpeg_process = await asyncio.create_subprocess_exec(
                 *ffmpeg_command,
                 stderr=asyncio.subprocess.PIPE,
@@ -371,6 +468,7 @@ async def lifespan(  # noqa: C901, PLR0915
                     ffmpeg_process.returncode,
                     stderr.decode(errors="replace").strip(),
                 )
+                tracker.event("error", "ffmpeg_failed", "FFmpeg failed to start, shutting down", sink_name)
                 with contextlib.suppress(TimeoutError):
                     cast.disconnect(timeout=0.0)
                 stream_dir.cleanup()
@@ -397,13 +495,29 @@ async def lifespan(  # noqa: C901, PLR0915
                     # INVALID_REQUEST. Quit it first so the default media receiver is launched.
                     if cast.app_id not in (None, APP_BACKDROP, APP_MEDIA_RECEIVER):
                         logger.info("Quitting app %s on %s before loading stream", cast.app_id, sink_name)
+                        tracker.set_phase(sink_name, "quitting_app", reason=cast.app_display_name or cast.app_id)
+                        tracker.event(
+                            "info",
+                            "quitting_app",
+                            f"Closing {cast.app_display_name or cast.app_id} on the Chromecast",
+                            sink_name,
+                            app=cast.app_display_name or cast.app_id,
+                        )
                         await asyncio.to_thread(cast.quit_app)
+                        tracker.set_phase(sink_name, "quitting_app", timeout=_APP_QUIT_DELAY)
                         await asyncio.sleep(_APP_QUIT_DELAY)
                     subscribe_to_stream(cast.media_controller, local_ip, streaming_port, stream_config)
-                except Exception:
+                    if tracker.phase_of(sink_name) in {"subscribing", "quitting_app"}:
+                        tracker.set_phase(sink_name, "loading")
+                    tracker.event("info", "loading", "Stream sent to the Chromecast", sink_name)
+                except Exception as exc:
                     logger.exception("Failed to subscribe Chromecast to stream")
+                    tracker.event(
+                        "error", "subscribe_failed", f"Could not start the stream: {exc}", sink_name, error=exc
+                    )
 
             subscribe_task = asyncio.create_task(subscribe())
+            tracker.set_phase(sink_name, "subscribing", timeout=_STREAM_SUBSCRIBE_DELAY)
 
             await controller.start_volume_sync()
 
@@ -414,11 +528,37 @@ async def lifespan(  # noqa: C901, PLR0915
             )
             cast.register_connection_listener(connection_listener)
 
+            async def watch_ffmpeg(process: asyncio.subprocess.Process) -> None:
+                # Drain stderr so FFmpeg never blocks on a full pipe, and log what it reports.
+                if process.stderr is not None:
+                    async for line in process.stderr:
+                        logger.warning("FFmpeg (%s): %s", sink_name, line.decode(errors="replace").rstrip())
+                returncode = await process.wait()
+                if _shutting_down:
+                    return
+                logger.error("FFmpeg exited unexpectedly (code %d) for %s, restarting stream", returncode, sink_name)
+                tracker.set_phase(sink_name, "restarting", timeout=_FFMPEG_RESTART_DELAY, reason="encoder exited")
+                tracker.event(
+                    "error",
+                    "ffmpeg_exited",
+                    f"Encoder stopped (code {returncode}), restarting",
+                    sink_name,
+                    exit_code=returncode,
+                )
+                await asyncio.sleep(_FFMPEG_RESTART_DELAY)
+                if _shutting_down:
+                    return
+                await restart_stream(sink_name)
+
+            ffmpeg_watcher = asyncio.create_task(watch_ffmpeg(ffmpeg_process))
+
             active_stream = ActiveStream(
+                sink_name=sink_name,
                 ffmpeg_process=ffmpeg_process,
                 stream_dir=stream_dir,
                 stream_app=stream_app,
                 subscribe_task=subscribe_task,
+                ffmpeg_watcher=ffmpeg_watcher,
                 volume_controller=controller,
                 connection_listener=connection_listener,
                 buffering_watchdog=buffering_watchdog,
@@ -428,16 +568,24 @@ async def lifespan(  # noqa: C901, PLR0915
 
         except Exception:
             logger.exception("Failed to activate stream for sink: %s", sink_name)
+            tracker.set_phase(sink_name, "ready", reason="activation failed")
+            tracker.event("error", "activation_failed", "Could not start the stream", sink_name)
+            monitor.clear_active()
             if subscribe_task is not None:
                 subscribe_task.cancel()
+            if ffmpeg_watcher is not None:
+                ffmpeg_watcher.cancel()
             if ffmpeg_process is not None and ffmpeg_process.returncode is None:
                 ffmpeg_process.terminate()
                 await ffmpeg_process.wait()
             stream_dir.cleanup()
 
-    async def on_deactivate(sink_name: str) -> None:
+    async def _deactivate(sink_name: str, next_phase: str = "ready") -> None:
         nonlocal active_stream
 
+        if active_stream is not None and active_stream.sink_name != sink_name:
+            logger.debug("Not deactivating %s: active stream belongs to %s", sink_name, active_stream.sink_name)
+            return
         if active_stream is not None:
             logger.info("Deactivating cast from sink: %s", sink_name)
             await active_stream.teardown()
@@ -446,10 +594,38 @@ async def lifespan(  # noqa: C901, PLR0915
             app.state.active_controller = None
             with contextlib.suppress(TimeoutError):
                 controllers[sink_name].cast.disconnect(timeout=0.0)
+            tracker.event("info", "stopped", "Stream stopped", sink_name)
+        if tracker.phase_of(sink_name) not in {None, "ready", "unavailable", "checking"}:
+            tracker.set_phase(sink_name, next_phase)
+
+    # Activation, deactivation and restarts are triggered from several places (sink-input
+    # monitor, buffering watchdog, connection listener, mDNS callbacks). Serialize them so
+    # an activation that is still waiting for its Chromecast cannot interleave with another
+    # one and leave an orphaned FFmpeg process or overwrite active_stream.
+    activation_lock = asyncio.Lock()
+
+    async def on_activate(sink_name: str) -> None:
+        async with activation_lock:
+            if active_stream is not None:
+                logger.warning(
+                    "Stream for %s still active while activating %s, tearing it down",
+                    active_stream.sink_name,
+                    sink_name,
+                )
+                await _deactivate(active_stream.sink_name)
+            await _activate(sink_name)
+
+    async def on_deactivate(sink_name: str) -> None:
+        async with activation_lock:
+            await _deactivate(sink_name)
 
     async def restart_stream(sink_name: str) -> None:
-        await on_deactivate(sink_name)
-        await on_activate(sink_name)
+        async with activation_lock:
+            if monitor.active_sink != sink_name:
+                logger.info("Not restarting %s: it is no longer the active sink", sink_name)
+                return
+            await _deactivate(sink_name, next_phase="restarting")
+            await _activate(sink_name)
 
     monitor = SinkInputMonitor(
         controllers=controllers,
@@ -458,7 +634,7 @@ async def lifespan(  # noqa: C901, PLR0915
     )
     await monitor.start()
 
-    async def mark_device_unavailable(sink_name: str, controller: SinkController) -> None:
+    async def mark_device_unavailable(sink_name: str, controller: SinkController, reason: str) -> None:
         """Shared cleanup for device removal and health-check failure."""
         if not controller.available:
             return
@@ -471,6 +647,8 @@ async def lifespan(  # noqa: C901, PLR0915
         await controller.remove_sink()
         await monitor.refresh_sink_indices()
         logger.info("Device no longer available: %s (%s)", sink_name, controller.device_id)
+        tracker.set_phase(sink_name, "unavailable", reason=reason)
+        tracker.event("warning", "unavailable", f"Device no longer available ({reason})", sink_name, reason=reason)
 
     def get_controller(device_id: UUID) -> SinkController | None:
         for controller in controllers.values():
@@ -479,8 +657,17 @@ async def lifespan(  # noqa: C901, PLR0915
         return None
 
     def address_matches(controller: SinkController, new_address: tuple[str, int]) -> bool:
-        current_address = (controller.cast.cast_info.host, controller.cast.cast_info.port)
-        return new_address == current_address
+        current_host, current_port = controller.cast.cast_info.host, controller.cast.cast_info.port
+        new_host, new_port = new_address
+        return _normalize_host(new_host) == _normalize_host(current_host) and new_port == current_port
+
+    async def handle_address_change(controller: SinkController, chromecast: Chromecast) -> None:
+        """Point an available controller at the device's new address without removing its sink."""
+        if active_stream is not None and monitor.active_sink == controller.sink_name:
+            # on_activate disconnects the old cast and connects to the new address
+            await restart_stream(controller.sink_name)
+        else:
+            controller.cast = chromecast
 
     _handling_devices: set[UUID] = set()
 
@@ -495,21 +682,25 @@ async def lifespan(  # noqa: C901, PLR0915
         finally:
             _handling_devices.discard(device_id)
 
-    async def _handle_device_add(device_id: UUID) -> None:
+    async def _handle_device_add(device_id: UUID) -> None:  # noqa: C901, PLR0912
         """React to mDNS add_service or update_service events to recover previously unavailable devices,
         mark newly unreachable devices unavailable, and handle potential IP changes."""
         controller = get_controller(device_id)
+        address_changed = False
         if controller:
             new_address = discovery.get_device_address(device_id)
             if new_address is None:
                 return
             if controller.available and not address_matches(controller, new_address):
+                # Common for speaker groups: the group leader (and with it the address)
+                # moves between members. Keep the sink so audio routed to it stays put.
                 logger.info(
-                    "Device %s address changed to: %s:%d, re-adding",
+                    "Device %s address changed to: %s:%d, reconnecting",
                     controller.sink_name,
                     *new_address,
                 )
-                await mark_device_unavailable(controller.sink_name, controller)
+                tracker.event("info", "address_changed", "Device changed address, checking it", controller.sink_name)
+                address_changed = True
             elif not controller.available and not await _tcp_probe(*new_address):
                 # Cheap pre-filter: skip expensive wait() if TCP is dead
                 logger.debug("TCP probe failed for %s at %s:%d", controller.sink_name, *new_address)
@@ -532,40 +723,76 @@ async def lifespan(  # noqa: C901, PLR0915
         chromecast = discovery.create_chromecast(device_id)
         if chromecast is None:
             return
+        if controller:
+            tracker.begin_check(controller.sink_name, CAST_CONNECT_TIMEOUT)
         with contextlib.suppress(RequestTimeout):
             await asyncio.to_thread(chromecast.wait, timeout=CAST_CONNECT_TIMEOUT)
         with contextlib.suppress(TimeoutError):
             chromecast.disconnect(timeout=0.0)
+        if controller:
+            tracker.end_check(controller.sink_name, available=controller.available and chromecast.status is not None)
 
         if chromecast.status is None:
             if controller and controller.available:
                 logger.warning("Device %s (%s) failed health check on add/update", controller.sink_name, device_id)
-                await mark_device_unavailable(controller.sink_name, controller)
+                await mark_device_unavailable(controller.sink_name, controller, "health check failed")
+                schedule_reconnect(controller, "health check failed")
             else:
                 logger.debug("Device %s not yet reachable at app level", device_id)
             return
 
         if not controller:
-            controller = SinkController(chromecast=chromecast)
+            controller = SinkController(chromecast=chromecast, sink_gain=sink_gain)
             await controller.init()
             controllers[controller.sink_name] = controller
             logger.info("Device added: %s", controller.sink_name)
+            tracker.add_device(controller.sink_name, chromecast.name)
+            tracker.event("info", "added", "New device found", controller.sink_name)
         elif not controller.available:
             controller.available = True
             await controller.init()
             logger.info("Device restored: %s", controller.sink_name)
+            tracker.set_phase(controller.sink_name, "ready")
+            tracker.event("info", "restored", "Device available again", controller.sink_name)
+        elif address_changed:
+            await handle_address_change(controller, chromecast)
         await monitor.refresh_sink_indices()
+
+    _reconnect_tasks: dict[UUID, asyncio.Task[None]] = {}
+
+    def schedule_reconnect(controller: SinkController, reason: str) -> None:
+        """Keep checking a device that became unreachable until it is back."""
+        task = _reconnect_tasks.get(controller.device_id)
+        if task is None or task.done():
+            _reconnect_tasks[controller.device_id] = spawn(reconnect(controller, reason))
+
+    async def reconnect(controller: SinkController, reason: str) -> None:
+        sink_name = controller.sink_name
+        try:
+            for attempt in itertools.count():
+                if controller.available or _shutting_down:
+                    return
+                delay = _RECONNECT_DELAYS[min(attempt, len(_RECONNECT_DELAYS) - 1)]
+                tracker.set_phase(sink_name, "unavailable", timeout=delay, reason=reason)
+                await asyncio.sleep(delay)
+                if controller.available or _shutting_down:
+                    return
+                logger.info("Checking if %s is reachable again (attempt %d)", sink_name, attempt + 1)
+                # The same check an mDNS update triggers: TCP probe, then a Chromecast connection.
+                await handle_device_add(controller.device_id)
+        finally:
+            _reconnect_tasks.pop(controller.device_id, None)
 
     async def handle_device_remove(device_id: UUID) -> None:
         for sink_name, controller in controllers.items():
             if controller.device_id == device_id:
-                await mark_device_unavailable(sink_name, controller)
+                await mark_device_unavailable(sink_name, controller, "removed from mDNS")
                 return
 
     discovery.set_callbacks(
-        on_add=lambda uuid: asyncio.run_coroutine_threadsafe(handle_device_add(uuid), loop),  # type: ignore[arg-type]
-        on_remove=lambda uuid: asyncio.run_coroutine_threadsafe(handle_device_remove(uuid), loop),  # type: ignore[arg-type]
-        on_update=lambda uuid: asyncio.run_coroutine_threadsafe(handle_device_add(uuid), loop),  # type: ignore[arg-type]
+        on_add=lambda uuid: spawn_threadsafe(loop, handle_device_add(uuid)),
+        on_remove=lambda uuid: spawn_threadsafe(loop, handle_device_remove(uuid)),
+        on_update=lambda uuid: spawn_threadsafe(loop, handle_device_add(uuid)),
     )
 
     app.state.controllers = controllers
@@ -599,7 +826,7 @@ async def lifespan(  # noqa: C901, PLR0915
     # gives us a reliable shutdown path that bypasses any signalfd issues.
     try:
         signal.pthread_sigmask(signal.SIG_UNBLOCK, {signal.SIGTERM})
-        loop.add_signal_handler(signal.SIGTERM, lambda: asyncio.create_task(_sigterm_handler()))
+        loop.add_signal_handler(signal.SIGTERM, lambda: spawn(_sigterm_handler()))
     except Exception:
         logger.debug("Could not install SIGTERM handler in event loop", exc_info=True)
 
@@ -626,7 +853,7 @@ async def pause(request: Request) -> Response:
     media_controller = _get_active_media_controller(request)
     if media_controller is None:
         return Response(content="No active device", status_code=404)
-    media_controller.pause()
+    await asyncio.to_thread(media_controller.pause)
     return Response(content="OK")
 
 
@@ -634,8 +861,8 @@ async def play(request: Request) -> Response:
     media_controller = _get_active_media_controller(request)
     if media_controller is None:
         return Response(content="No active device", status_code=404)
-    media_controller.play()
-    media_controller.seek(None)  # pyright: ignore[reportArgumentType]
+    await asyncio.to_thread(media_controller.play)
+    await asyncio.to_thread(media_controller.seek, None)  # pyright: ignore[reportArgumentType]
     return Response(content="OK")
 
 
@@ -654,6 +881,44 @@ async def devices(request: Request) -> Response:
         for sink_name, controller in controllers.items()
     ]
     return JSONResponse(device_list)
+
+
+async def status_snapshot(request: Request) -> Response:  # noqa: ARG001
+    return JSONResponse(tracker.snapshot())
+
+
+_STATUS_HEARTBEAT = 5.0  # seconds between status messages when nothing changes
+
+
+async def status_events(websocket: WebSocket) -> None:
+    """Push the status to a UI: a full ``status`` message on connect, then ``status``
+    messages when something changes (and every few seconds, so stream ages stay
+    current) and ``event`` messages for the event log."""
+    await websocket.accept()
+    queue = tracker.subscribe()
+
+    async def send() -> None:
+        await websocket.send_json({"type": "status", "status": tracker.snapshot()})  # with the event log
+        while True:
+            with contextlib.suppress(TimeoutError):
+                while True:
+                    await websocket.send_text(await asyncio.wait_for(queue.get(), _STATUS_HEARTBEAT))
+            await websocket.send_json({"type": "status", "status": tracker.status_only()})
+
+    async def send_until_closed() -> None:
+        with contextlib.suppress(WebSocketDisconnect, RuntimeError, OSError):  # client went away
+            await send()
+
+    sender = asyncio.create_task(send_until_closed())
+    try:
+        # The server answers pings and notices a closed connection only while we receive.
+        while (await websocket.receive())["type"] != "websocket.disconnect":
+            pass
+    except (WebSocketDisconnect, RuntimeError):
+        pass
+    finally:
+        sender.cancel()
+        tracker.unsubscribe(queue)
 
 
 def create_app() -> Starlette:
@@ -677,6 +942,7 @@ def create_app() -> Starlette:
     chromecasts = discovery.discover()
 
     streaming_port = int(os.environ["PCAST_PORT"])
+    sink_gain = float(os.environ.get("PCAST_SINK_GAIN", DEFAULT_SINK_GAIN))
     stream_config = StreamConfig(
         acodec="aac",
         bitrate=os.environ["PCAST_BITRATE"],
@@ -687,6 +953,7 @@ def create_app() -> Starlette:
     for chromecast in chromecasts:
         controller = SinkController(
             chromecast=chromecast,
+            sink_gain=sink_gain,
         )
         controllers[controller.sink_name] = controller
 
@@ -710,6 +977,8 @@ def create_app() -> Starlette:
             Route("/pause", endpoint=pause),
             Route("/play", endpoint=play),
             Route("/devices", endpoint=devices),
+            Route("/status", endpoint=status_snapshot),
+            WebSocketRoute("/events", endpoint=status_events),
         ],
         lifespan=partial(
             lifespan,
@@ -717,6 +986,7 @@ def create_app() -> Starlette:
             stream_config=stream_config,
             discovery=discovery,
             streaming_port=streaming_port,
+            sink_gain=sink_gain,
         ),
         middleware=middleware,
     )

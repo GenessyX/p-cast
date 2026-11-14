@@ -12,7 +12,10 @@ import pulsectl_asyncio
 from pychromecast import Chromecast
 from pychromecast.controllers.receiver import CastStatus, CastStatusListener
 
+from p_cast.config import DEFAULT_SINK_GAIN
 from p_cast.exceptions import SinkError
+from p_cast.status import status as tracker
+from p_cast.tasks import spawn_threadsafe
 
 logger = logging.getLogger(__name__)
 
@@ -23,6 +26,16 @@ type DeactivationCallback = Callable[[str], Coroutine[None, None, None]]
 _SINK_NAME_INVALID_CHARS = re.compile(r"[^a-zA-Z0-9_-]")
 
 _MIN_AUDIBLE_VOLUME = 0.1
+# Less than a single volume-up/down step; also absorbs PulseAudio's volume quantization.
+_VOLUME_EPSILON = 0.005
+# Keep streaming this long after the last sink-input is gone (track changes, short pauses).
+_DEACTIVATION_GRACE = 15.0
+
+
+def _app_name(sink_input: pulsectl.PulseSinkInputInfo) -> str | None:
+    """Name of the application that plays into a sink-input, as shown by the desktop."""
+    props = typing.cast("dict[str, str]", sink_input.proplist)  # pyright: ignore[reportAttributeAccessIssue]
+    return props.get("application.name") or props.get("application.process.binary") or None
 
 
 def _make_sink_name(chromecast_name: str) -> str:
@@ -38,7 +51,7 @@ class _CastVolumeSync(CastStatusListener):
     """Bridges Chromecast-initiated volume/mute changes back to the PA sink.
 
     new_cast_status() runs on pychromecast's socket thread; the apply
-    coroutine is scheduled onto the event loop via run_coroutine_threadsafe.
+    coroutine is scheduled onto the event loop via spawn_threadsafe.
     """
 
     def __init__(
@@ -61,7 +74,7 @@ class _CastVolumeSync(CastStatusListener):
         muted = status.volume_muted
         if level is None:
             return
-        asyncio.run_coroutine_threadsafe(self._on_volume_change(level, muted), self._loop)
+        spawn_threadsafe(self._loop, self._on_volume_change(level, muted))
 
 
 class SinkController:
@@ -74,8 +87,9 @@ class SinkController:
     _sink_module_id: int
     _volume_listener: asyncio.Task[None]
 
-    def __init__(self, chromecast: Chromecast) -> None:
+    def __init__(self, chromecast: Chromecast, sink_gain: float = DEFAULT_SINK_GAIN) -> None:
         self.cast = chromecast
+        self._sink_gain = sink_gain
         self.sink_name = _make_sink_name(chromecast.name)  # type: ignore[arg-type]
         self._sink_friendly_name = _make_friendly_sink_name(chromecast.name)  # type: ignore[arg-type]
         self._sink_module_id = -1
@@ -97,6 +111,8 @@ class SinkController:
     async def start_volume_sync(self) -> None:
         self._synced_volume: float | None = None
         self._synced_mute: bool | None = None
+        # Number of our own set_volume/set_volume_muted calls waiting for the device.
+        self._cast_requests_in_flight = 0
         self._volume_listener = asyncio.create_task(self._subscribe_volume())
         self._volume_listener.add_done_callback(self._on_volume_listener_done)
         loop = asyncio.get_running_loop()
@@ -117,11 +133,32 @@ class SinkController:
         if hasattr(self, "_volume_listener"):
             self._volume_listener.cancel()
 
+    async def _remove_leftover_sink(self, name: str) -> None:
+        """Unload a null sink with our name left behind by a previous run that did not exit cleanly.
+
+        Otherwise a second sink with the same name is created, and lookups by name may
+        return the stale one, which nothing reads from.
+        """
+        try:
+            sink = await self._pulse.get_sink_by_name(name)
+        except pulsectl.PulseIndexError:
+            return
+        module_index: int = sink.owner_module  # pyright: ignore[reportAttributeAccessIssue]
+        try:
+            module = await self._pulse.module_info(module_index)
+        except pulsectl.PulseIndexError:
+            return
+        if module.name != "module-null-sink":  # pyright: ignore[reportAttributeAccessIssue]
+            return
+        logger.warning("Removing leftover sink %s (module %d) from a previous run", name, module_index)
+        await self._pulse.module_unload(module_index)
+
     async def create_sink(self, name: str, friendly_name: str) -> int:
+        await self._remove_leftover_sink(name)
         sink_properties = [
             f"device.description='{friendly_name}'",
-            "channelmix.min-volume=5.0",
-            "channelmix.max-volume=5.0",
+            f"channelmix.min-volume={self._sink_gain}",
+            f"channelmix.max-volume={self._sink_gain}",
             "channelmix.normalize=true",
         ]
         module_args = [
@@ -191,9 +228,12 @@ class SinkController:
 
         Skips the update if the values are already in sync (e.g. an echo of our
         own set_volume call), preventing feedback loops with _subscribe_volume.
+        Statuses received while our own request is in flight are replies to it
+        (possibly to an older one), not user changes on the device: ignore them.
         """
-        volume_epsilon = 0.005  # less than a single volume-up/down step
-        level_changed = self._synced_volume is None or abs(level - self._synced_volume) > volume_epsilon
+        if self._cast_requests_in_flight:
+            return
+        level_changed = self._synced_volume is None or abs(level - self._synced_volume) > _VOLUME_EPSILON
         mute_changed = self._synced_mute is None or muted != self._synced_mute
         if not level_changed and not mute_changed:
             return
@@ -218,9 +258,9 @@ class SinkController:
             cast_volume = self.cast.status.volume_level  # type: ignore[union-attr]
             cast_mute = self.cast.status.volume_muted  # type: ignore[union-attr]
             if cast_mute:
-                self.cast.set_volume_muted(muted=False)
+                await asyncio.to_thread(self.cast.set_volume_muted, muted=False)
             if cast_volume is not None and cast_volume < _MIN_AUDIBLE_VOLUME:
-                self.cast.set_volume(_MIN_AUDIBLE_VOLUME)
+                await asyncio.to_thread(self.cast.set_volume, _MIN_AUDIBLE_VOLUME)
                 cast_volume = _MIN_AUDIBLE_VOLUME
             if cast_volume is not None:
                 await self._pulse.volume_set_all_chans(sink, cast_volume)
@@ -243,15 +283,26 @@ class SinkController:
             changed_sink = await self.get_sink()
             changed_volume = self.get_volume(changed_sink)
             changed_mute = self.get_mute(changed_sink)
+            # pychromecast waits for the device's reply (up to its request timeout);
+            # run it off the event loop, which also serves the HLS segments.
+            # Update the synced state before awaiting, so a cast status received in the
+            # meantime is not mistaken for a change made on the device.
+            volume_changed = self._synced_volume is None or abs(changed_volume - self._synced_volume) > _VOLUME_EPSILON
+            mute_changed = changed_mute != self._synced_mute
+            if not volume_changed and not mute_changed:
+                continue
+            self._cast_requests_in_flight += 1
             try:
-                if changed_volume != self._synced_volume:
-                    self.cast.set_volume(volume=changed_volume)
+                if volume_changed:
                     self._synced_volume = changed_volume
-                if changed_mute != self._synced_mute:
-                    self.cast.set_volume_muted(muted=changed_mute)
+                    await asyncio.to_thread(self.cast.set_volume, volume=changed_volume)
+                if mute_changed:
                     self._synced_mute = changed_mute
+                    await asyncio.to_thread(self.cast.set_volume_muted, muted=changed_mute)
             except Exception:
                 logger.warning("Failed to sync volume to Chromecast", exc_info=True)
+            finally:
+                self._cast_requests_in_flight -= 1
 
 
 class SinkInputMonitor:
@@ -297,6 +348,8 @@ class SinkInputMonitor:
         if self._deactivation_task is not None:
             self._deactivation_task.cancel()
             self._deactivation_task = None
+            if self._active_sink is not None:
+                tracker.restore_player_phase(self._active_sink)
 
     async def stop(self) -> None:
         self._cancel_deferred_deactivation()
@@ -312,7 +365,8 @@ class SinkInputMonitor:
     async def refresh_sink_indices(self) -> None:
         """Re-query all controllers to rebuild the sink index mapping."""
         mapping: dict[int, str] = {}
-        for sink_name, controller in self._controllers.items():
+        # Copy: devices can be added or removed while get_sink() awaits.
+        for sink_name, controller in list(self._controllers.items()):
             if not controller.available:
                 continue
             try:
@@ -341,6 +395,7 @@ class SinkInputMonitor:
                         await self._on_deactivate(self._active_sink)
                     self._active_sink = sink_name
                     logger.info("Existing sink-input detected on: %s", sink_name)
+                    tracker.set_source(_app_name(si))
                     await self._on_activate(sink_name)
 
     async def _monitor(self) -> None:
@@ -388,17 +443,32 @@ class SinkInputMonitor:
                             self._active_sink,
                             sink_name,
                         )
+                        tracker.event(
+                            "info",
+                            "switching",
+                            f"Audio moved to {sink_name}, stopping {self._active_sink}",
+                            sink_name,
+                            previous=self._active_sink,
+                        )
                         await self._on_deactivate(self._active_sink)
                     self._active_sink = sink_name
                     self._active_sink_inputs.clear()
                     logger.info("Sink activated: %s", sink_name)
+                    tracker.set_source(_app_name(si))
+                    tracker.event(
+                        "info", "activated", f"Audio from {_app_name(si) or 'an app'}", sink_name, app=_app_name(si)
+                    )
                     await self._on_activate(sink_name)
-                self._active_sink_inputs.add(sink_input_index)
+                # A failed activation calls clear_active(); don't track the input then,
+                # so the next event for it retries the activation.
+                if self._active_sink == sink_name:
+                    self._active_sink_inputs.add(sink_input_index)
             elif sink_input_index in self._active_sink_inputs:
                 # Sink-input moved away from our sink to a non-monitored sink
                 self._active_sink_inputs.discard(sink_input_index)
                 if not self._active_sink_inputs and self._active_sink is not None:
                     logger.info("Sink deactivated (moved away): %s", self._active_sink)
+                    tracker.event("info", "moved_away", "Audio moved to another output", self._active_sink)
                     await self._on_deactivate(self._active_sink)
                     self._active_sink = None
             break
@@ -413,18 +483,25 @@ class SinkInputMonitor:
             self._deactivation_task = asyncio.create_task(
                 self._deferred_deactivate(self._active_sink),
             )
+            tracker.set_phase(self._active_sink, "lingering", timeout=_DEACTIVATION_GRACE, reason="no audio")
 
-    async def _deferred_deactivate(self, sink_name: str, delay_s: int = 15) -> None:
+    async def _deferred_deactivate(self, sink_name: str, delay_s: float = _DEACTIVATION_GRACE) -> None:
         """Wait briefly before deactivating to handle song transitions / avoid excessive reconnects."""
         try:
             await asyncio.sleep(delay_s)
         except asyncio.CancelledError:
             return
+        # From here on the deactivation must run to the end: a sink-input that shows up
+        # meanwhile would cancel this task halfway through the teardown (FFmpeg stopped,
+        # stream still marked active) and then never trigger an activation.
+        self._deactivation_task = None
         if not self._active_sink_inputs and self._active_sink == sink_name:
             logger.info("Sink deactivated (after grace period): %s", sink_name)
-            await self._on_deactivate(sink_name)
+            tracker.event("info", "idle_stop", f"No audio for {delay_s:.0f}s", sink_name, seconds=delay_s)
+            # Clear first, so a new sink-input during the teardown activates the sink again
+            # (on_activate waits for the teardown to finish).
             self._active_sink = None
-        self._deactivation_task = None
+            await self._on_deactivate(sink_name)
 
     def clear_active(self) -> None:
         """Reset active state so the monitor can re-detect existing sink-inputs."""
