@@ -5,6 +5,8 @@ type AudioCodec = Literal["aac"]
 type HlsSegmentType = Literal["mpegts", "fmp4"]
 
 MAX_SAMPLE_RATE = 96000
+# Unity gain avoids amplifying and clipping full-scale sources.
+DEFAULT_SINK_GAIN = 1.0
 
 
 @dataclass

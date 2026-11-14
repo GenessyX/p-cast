@@ -13,6 +13,7 @@ from typing import override
 from uuid import UUID
 
 from pychromecast import Chromecast
+from pychromecast.config import APP_BACKDROP, APP_MEDIA_RECEIVER
 from pychromecast.controllers.media import MediaStatus, MediaStatusListener
 from pychromecast.error import RequestTimeout
 from pychromecast.socket_client import (
@@ -32,7 +33,7 @@ from starlette.routing import Route
 from starlette.staticfiles import StaticFiles
 
 from p_cast.cast import CastDiscovery, get_local_ip, subscribe_to_stream
-from p_cast.config import MAX_SAMPLE_RATE, StreamConfig
+from p_cast.config import DEFAULT_SINK_GAIN, MAX_SAMPLE_RATE, StreamConfig
 from p_cast.device import SinkController, SinkInputMonitor
 from p_cast.ffmpeg import create_ffmpeg_stream_command
 
@@ -54,6 +55,7 @@ def _sd_notify(state: str) -> None:
 
 _FFMPEG_STARTUP_DELAY = 0.5
 _STREAM_SUBSCRIBE_DELAY = 2
+_APP_QUIT_DELAY = 1.0
 _BUFFERING_RECOVER_TIMEOUT = 6  # seconds of sustained BUFFERING before restarting stream (6 is minimum)
 
 
@@ -279,6 +281,7 @@ async def lifespan(  # noqa: C901, PLR0915
     stream_config: StreamConfig,
     discovery: CastDiscovery,
     streaming_port: int,
+    sink_gain: float = DEFAULT_SINK_GAIN,
 ) -> AsyncIterator[None]:
     for controller in controllers.values():
         await controller.init()
@@ -407,6 +410,13 @@ async def lifespan(  # noqa: C901, PLR0915
             async def subscribe() -> None:
                 await asyncio.sleep(_STREAM_SUBSCRIBE_DELAY)
                 try:
+                    # A device that is still running another receiver app (e.g. the follower
+                    # app it runs while part of a speaker group) rejects LOAD with
+                    # INVALID_REQUEST. Quit it first so the default media receiver is launched.
+                    if cast.app_id not in (None, APP_BACKDROP, APP_MEDIA_RECEIVER):
+                        logger.info("Quitting app %s on %s before loading stream", cast.app_id, sink_name)
+                        await asyncio.to_thread(cast.quit_app)
+                        await asyncio.sleep(_APP_QUIT_DELAY)
                     subscribe_to_stream(cast.media_controller, local_ip, streaming_port, stream_config)
                 except Exception:
                     logger.exception("Failed to subscribe Chromecast to stream")
@@ -566,7 +576,7 @@ async def lifespan(  # noqa: C901, PLR0915
             return
 
         if not controller:
-            controller = SinkController(chromecast=chromecast)
+            controller = SinkController(chromecast=chromecast, sink_gain=sink_gain)
             await controller.init()
             controllers[controller.sink_name] = controller
             logger.info("Device added: %s", controller.sink_name)
@@ -699,6 +709,7 @@ def create_app() -> Starlette:
     chromecasts = discovery.discover()
 
     streaming_port = int(os.environ["PCAST_PORT"])
+    sink_gain = float(os.environ.get("PCAST_SINK_GAIN", DEFAULT_SINK_GAIN))
     stream_config = StreamConfig(
         acodec="aac",
         bitrate=os.environ["PCAST_BITRATE"],
@@ -709,6 +720,7 @@ def create_app() -> Starlette:
     for chromecast in chromecasts:
         controller = SinkController(
             chromecast=chromecast,
+            sink_gain=sink_gain,
         )
         controllers[controller.sink_name] = controller
 
@@ -739,6 +751,7 @@ def create_app() -> Starlette:
             stream_config=stream_config,
             discovery=discovery,
             streaming_port=streaming_port,
+            sink_gain=sink_gain,
         ),
         middleware=middleware,
     )

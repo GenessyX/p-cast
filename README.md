@@ -65,6 +65,7 @@ Note: Ensure that the chosen port (3000 by default) is open for incoming connect
                                logging level (default: INFO)
         --daemonize            detach from terminal and run as a background daemon (requires --log-file)
         --pid-file PATH        write PID to this file on startup
+        --sink-gain GAIN       fixed linear gain applied by the virtual sinks; 1.0 is unity (default: 1.0)
 
 ## Requirements
 

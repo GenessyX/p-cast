@@ -12,6 +12,7 @@ import pulsectl_asyncio
 from pychromecast import Chromecast
 from pychromecast.controllers.receiver import CastStatus, CastStatusListener
 
+from p_cast.config import DEFAULT_SINK_GAIN
 from p_cast.exceptions import SinkError
 
 logger = logging.getLogger(__name__)
@@ -74,8 +75,9 @@ class SinkController:
     _sink_module_id: int
     _volume_listener: asyncio.Task[None]
 
-    def __init__(self, chromecast: Chromecast) -> None:
+    def __init__(self, chromecast: Chromecast, sink_gain: float = DEFAULT_SINK_GAIN) -> None:
         self.cast = chromecast
+        self._sink_gain = sink_gain
         self.sink_name = _make_sink_name(chromecast.name)  # type: ignore[arg-type]
         self._sink_friendly_name = _make_friendly_sink_name(chromecast.name)  # type: ignore[arg-type]
         self._sink_module_id = -1
@@ -120,8 +122,8 @@ class SinkController:
     async def create_sink(self, name: str, friendly_name: str) -> int:
         sink_properties = [
             f"device.description='{friendly_name}'",
-            "channelmix.min-volume=5.0",
-            "channelmix.max-volume=5.0",
+            f"channelmix.min-volume={self._sink_gain}",
+            f"channelmix.max-volume={self._sink_gain}",
             "channelmix.normalize=true",
         ]
         module_args = [
