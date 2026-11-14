@@ -1,6 +1,14 @@
 # CHANGELOG
 
 
+## v2.1.1 (2026-11-14)
+
+### Bug Fixes
+
+- Dependencies upper bounds
+  ([`6c7aceb`](https://github.com/GenessyX/p-cast/commit/6c7acebe3fc1f3bf13d8deaef00b60cdb1001ec9))
+
+
 ## v2.1.0 (2026-11-14)
 
 ### Bug Fixes
