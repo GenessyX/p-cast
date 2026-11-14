@@ -47,7 +47,7 @@ repos:
         stages: [pre-commit]
       - id: mypy
         name: mypy
-        entry: uv run --locked mypy --strict p_cast
+        entry: uv run --locked --group test mypy --strict p_cast tests
         language: system
         pass_filenames: false
         stages: [pre-commit]

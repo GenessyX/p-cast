@@ -199,12 +199,26 @@ Run the same checks as CI:
 ```bash
 uv run ruff check .
 uv run ruff format --check .
-uv run mypy --strict p_cast
+uv run --group test mypy --strict p_cast tests
 ```
 
 Ruff, mypy and pre-commit are development dependencies; installing `p-cast` from
 PyPI does not install them. For a runtime-only source environment, use
 `uv sync --locked --no-default-groups`.
+
+Install the optional test group and run the application behavior tests:
+
+```bash
+uv sync --locked --group test
+uv run --no-sync pytest
+```
+
+The tests mock Chromecast, PulseAudio and FFmpeg I/O; they need no devices, audio
+server or encoder. Linux still needs `libpulse0` to import the PulseAudio bindings.
+CI runs the same suite with locked dependencies and with the latest runtime
+dependencies allowed by the project's version bounds. Both test jobs and linting
+must pass before an automatic release. To require them before merging, select
+**Linting**, **Tests (locked)** and **Tests (latest)** in the branch rules.
 
 ## License
 
