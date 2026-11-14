@@ -241,6 +241,7 @@ class ActiveStream:
 
     def __init__(
         self,
+        sink_name: str,
         ffmpeg_process: asyncio.subprocess.Process,
         stream_dir: tempfile.TemporaryDirectory[str],
         stream_app: StaticFilesWithCORS,
@@ -249,6 +250,7 @@ class ActiveStream:
         connection_listener: CastConnectionListener,
         buffering_watchdog: BufferingWatchdog,
     ) -> None:
+        self.sink_name = sink_name
         self.ffmpeg_process = ffmpeg_process
         self.stream_dir = stream_dir
         self.stream_app = stream_app
@@ -306,7 +308,7 @@ async def lifespan(  # noqa: C901, PLR0915
         await monitor.refresh_sink_indices()
         monitor.clear_active()
 
-    async def on_activate(sink_name: str) -> None:  # noqa: PLR0915, C901
+    async def _activate(sink_name: str) -> None:  # noqa: PLR0915, C901
         nonlocal active_stream
         nonlocal local_ip
 
@@ -433,6 +435,7 @@ async def lifespan(  # noqa: C901, PLR0915
             cast.register_connection_listener(connection_listener)
 
             active_stream = ActiveStream(
+                sink_name=sink_name,
                 ffmpeg_process=ffmpeg_process,
                 stream_dir=stream_dir,
                 stream_app=stream_app,
@@ -453,9 +456,12 @@ async def lifespan(  # noqa: C901, PLR0915
                 await ffmpeg_process.wait()
             stream_dir.cleanup()
 
-    async def on_deactivate(sink_name: str) -> None:
+    async def _deactivate(sink_name: str) -> None:
         nonlocal active_stream
 
+        if active_stream is not None and active_stream.sink_name != sink_name:
+            logger.debug("Not deactivating %s: active stream belongs to %s", sink_name, active_stream.sink_name)
+            return
         if active_stream is not None:
             logger.info("Deactivating cast from sink: %s", sink_name)
             await active_stream.teardown()
@@ -465,9 +471,34 @@ async def lifespan(  # noqa: C901, PLR0915
             with contextlib.suppress(TimeoutError):
                 controllers[sink_name].cast.disconnect(timeout=0.0)
 
+    # Activation, deactivation and restarts are triggered from several places (sink-input
+    # monitor, buffering watchdog, connection listener, mDNS callbacks). Serialize them so
+    # an activation that is still waiting for its Chromecast cannot interleave with another
+    # one and leave an orphaned FFmpeg process or overwrite active_stream.
+    activation_lock = asyncio.Lock()
+
+    async def on_activate(sink_name: str) -> None:
+        async with activation_lock:
+            if active_stream is not None:
+                logger.warning(
+                    "Stream for %s still active while activating %s, tearing it down",
+                    active_stream.sink_name,
+                    sink_name,
+                )
+                await _deactivate(active_stream.sink_name)
+            await _activate(sink_name)
+
+    async def on_deactivate(sink_name: str) -> None:
+        async with activation_lock:
+            await _deactivate(sink_name)
+
     async def restart_stream(sink_name: str) -> None:
-        await on_deactivate(sink_name)
-        await on_activate(sink_name)
+        async with activation_lock:
+            if monitor.active_sink != sink_name:
+                logger.info("Not restarting %s: it is no longer the active sink", sink_name)
+                return
+            await _deactivate(sink_name)
+            await _activate(sink_name)
 
     monitor = SinkInputMonitor(
         controllers=controllers,
