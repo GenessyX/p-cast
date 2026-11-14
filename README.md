@@ -187,11 +187,24 @@ This delay is primarily due to how Chromecast handles **HLS streaming**, which i
 
 ## Contributing
 
-1. Install pre-commit hooks:
+Install development dependencies and pre-commit hooks:
 
 ```bash
+uv sync --locked
 uv run pre-commit install
 ```
+
+Run the same checks as CI:
+
+```bash
+uv run ruff check .
+uv run ruff format --check .
+uv run mypy --strict p_cast
+```
+
+Ruff, mypy and pre-commit are development dependencies; installing `p-cast` from
+PyPI does not install them. For a runtime-only source environment, use
+`uv sync --locked --no-default-groups`.
 
 ## License
 
